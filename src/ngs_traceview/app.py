@@ -99,6 +99,7 @@ class TraceViewer(App):
         self._last_wheel_push = 0.0
         self._hover_px = (0, 0)
         self._shown_pick = None  # interval idx currently in the tooltip
+        self._click_highlight = None  # fn value highlighted via double-click
         self._hide_timer = None
         self._stats_open = False
         self._stats_width = 460  # remembered panel width (px)
@@ -209,8 +210,9 @@ class TraceViewer(App):
         self.splitter.on("update:model-value", self._on_splitter)
         mid = Div(self.splitter, self.loading, ui_class=str(style.mid))
 
+        # detail bar is always present (fixed height) so clicking never shifts
+        # the layout; empty state shows a faint hint
         self.detail = Div(ui_class=str(style.detail))
-        self.detail.ui_hidden = True
         self.status = Div("open a .trace file to begin", ui_class=str(style.status))
 
         self.component = Div(bar, mid, self.detail, self.status, ui_class=str(style.page))
@@ -270,7 +272,7 @@ class TraceViewer(App):
              "sortable": True, "classes": "tv-fn", "headerClasses": "tv-fn"},
             {"name": "count", "label": "Calls", "field": "count", "align": "right", "sortable": True},
             {"name": "total", "label": "Total s", "field": "total", "align": "right", "sortable": True},
-            {"name": "pct", "label": "%", "field": "pct", "align": "right", "sortable": True},
+            {"name": "pct", "label": "Busy %", "field": "pct", "align": "right", "sortable": True},
             {"name": "mean", "label": "Mean ms", "field": "mean", "align": "right", "sortable": True},
             {"name": "max", "label": "Max ms", "field": "max", "align": "right", "sortable": True},
         ]
@@ -404,6 +406,7 @@ class TraceViewer(App):
 
         self._build_overlay_pools()
         self.view.apply()
+        self._show_detail_empty()
 
     def _on_resize(self, *args):
         if self.view is not None:
@@ -502,7 +505,16 @@ class TraceViewer(App):
         self.view.apply()
 
     def _on_dblclick(self, ev):
-        self._on_fit()
+        """Double-click a block: highlight that function and dim everything else."""
+        trace = self.trace
+        idx = self._shown_pick
+        if trace is None or idx is None:
+            return
+        value = int(trace.value[idx])
+        self._click_highlight = value
+        self._set_highlight(value)
+        self._sync_stats_selection(value)
+        self._show_detail(value, idx)
 
     def _on_fit(self, *_):
         if self.view is None:
@@ -516,10 +528,12 @@ class TraceViewer(App):
             self.view.set_highlight(value)
 
     def _clear_highlight(self, *_):
+        self._click_highlight = None
         self.search_input.ui_model_value = ""
         self.search_input.ui_error = False
         self._set_highlight(None)
         self._sync_stats_selection(None)
+        self._show_detail_empty()
 
     # ---- regex search highlight ----
 
@@ -539,6 +553,7 @@ class TraceViewer(App):
             self.search_input.ui_error = True  # invalid regex: leave view as is
             return
         self.search_input.ui_error = False
+        self._click_highlight = None  # search now drives the highlight
         matches = [i for i, name in enumerate(self.trace.names) if rx.search(name)]
         self._set_highlight(matches or None)
         if self._stats_open:
@@ -633,22 +648,24 @@ class TraceViewer(App):
         self._schedule_hide()
 
     def _on_click(self, ev):
-        """Left-click a block: highlight that function and pin its details."""
+        """Left-click a block: show its info. If a double-click highlight is
+        active, clicking again removes it (toggle off)."""
         if ev.get("button", 0) != 0:  # right-click is handled as "go back"
             return
+        if self._click_highlight is not None:
+            self._click_highlight = None
+            self._set_highlight(None)
+            self._sync_stats_selection(None)
         trace = self.trace
         idx = self._shown_pick
         if trace is None or idx is None:
-            self._set_highlight(None)
-            self._sync_stats_selection(None)
-            self.detail.ui_hidden = True
+            self._show_detail_empty()
             return
-        value = int(trace.value[idx])
-        self._set_highlight(value)
-        self._sync_stats_selection(value)
-        self._show_detail(value, idx)
+        self._show_detail(int(trace.value[idx]), idx)
 
     def _show_detail(self, value, idx):
+        import numpy as np
+
         trace = self.trace
         name = trace.names[value]
         start, end = trace.start[idx], trace.end[idx]
@@ -656,26 +673,41 @@ class TraceViewer(App):
         count = int(mask.sum())
         total = float((trace.end - trace.start)[mask].sum())
         span = max(trace.tmax - trace.tmin, 1e-12)
+        # "busy": union of this function's intervals (parallel/nested-safe)
+        sm, em = trace.start[mask], trace.end[mask]
+        order = np.argsort(sm)
+        s, e = sm[order], em[order]
+        run = np.maximum.accumulate(e)
+        prev = np.empty_like(run)
+        prev[0] = -np.inf
+        prev[1:] = run[:-1]
+        busy = float(np.maximum(0.0, e - np.maximum(s, prev)).sum())
         _, step = nice_ticks(self.view.t0, self.view.t1)
-        close = QBtn(ui_icon="close", ui_flat=True, ui_dense=True, ui_round=True, ui_size="sm")
-        close.on_click(self._clear_detail)
+        close = QBtn(
+            QTooltip("Clear highlight"),
+            ui_icon="close", ui_flat=True, ui_dense=True, ui_round=True, ui_size="sm",
+        )
+        close.on_click(self._clear_highlight)
         self.detail.ui_children = [
             _swatch(trace.colors[value]),
             Div(name, ui_class=str(style.detail_name)),
             Div(
                 f"this call {format_duration(end - start)} @ {format_time(start, step / 100)}"
-                f"   ·   {count:,} calls, {format_duration(total)} total "
-                f"({100 * total / span:.1f}% of trace)",
+                f"   ·   {count:,} calls · {format_duration(total)} total · "
+                f"busy {100 * busy / span:.1f}% of the trace",
                 ui_class=str(style.detail_meta),
             ),
             close,
         ]
-        self.detail.ui_hidden = False
 
-    def _clear_detail(self, *_):
-        self.detail.ui_hidden = True
-        self._set_highlight(None)
-        self._sync_stats_selection(None)
+    def _show_detail_empty(self):
+        if self.trace is None:
+            self.detail.ui_children = []
+            return
+        self.detail.ui_children = [
+            Div("Click a task to inspect it · double-click to highlight it",
+                ui_class=str(style.detail_hint))
+        ]
 
     # ---- statistics panel ----
 
@@ -747,6 +779,7 @@ class TraceViewer(App):
         selected = ev.value if hasattr(ev, "value") else ev
         selected = selected or []
         self.stats_table.ui_selected = selected
+        self._click_highlight = None  # table selection drives the highlight
         values = [int(r["value"]) for r in selected]
         self._set_highlight(values if values else None)
 

@@ -126,17 +126,19 @@ swatch = _cls(
     flex="none", border_radius="var(--r-xs)", border="1px solid rgba(0,0,0,.25)",
 )
 
-# ── detail banner ────────────────────────────────────────────────────────────
+# ── detail banner (always present, fixed height so it never shifts layout) ────
 detail = _cls(
     "tv-detail", display="flex", align_items="center", gap="12px", flex="none",
-    padding="8px 12px", background="var(--panel)",
-    border_top="1px solid var(--border)",
+    height="46px", padding="0 12px", overflow="hidden",
+    background="var(--panel)", border_top="1px solid var(--border)",
     font_size="12px", color="var(--fg)",
 )
 detail_name = _cls("tv-detail-name", font_family="var(--font-mono)", font_size="11px",
-                   color="var(--fg)", overflow_wrap="anywhere", flex="1", min_width="0")
+                   color="var(--fg)", white_space="nowrap", overflow="hidden",
+                   text_overflow="ellipsis", flex="1", min_width="0")
 detail_meta = _cls("tv-detail-meta", font_family="var(--font-mono)", font_size="11.5px",
                    color="var(--fg-muted)", white_space="nowrap")
+detail_hint = _cls("tv-detail-hint", color="var(--fg-faint)", font_size="12px")
 
 # ── status bar ───────────────────────────────────────────────────────────────
 status = _cls(

@@ -23,5 +23,6 @@ python -m ngs_traceview mytrace.trace    # equivalent (module form)
 | mouse wheel | zoom time axis (at cursor) |
 | ctrl + wheel | zoom rows (at cursor) |
 | hover | tooltip with task name and duration |
-| click | highlight that function + pin details/stats |
-| double click / fit button | zoom to full trace |
+| click | show the task's info in the bottom bar |
+| double click | highlight that function, dim everything else |
+| fit button (toolbar) | zoom to the full trace |

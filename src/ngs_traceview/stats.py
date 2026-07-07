@@ -13,11 +13,35 @@ class FunctionStat:
     name: str
     color: tuple  # (r, g, b) 0..1
     count: int
-    total: float  # ms
+    total: float  # ms, cumulative across all rows/threads
     mean: float  # ms
     min: float  # ms
     max: float  # ms
-    percent: float  # of the aggregated time span
+    percent: float  # "busy": union of the intervals / span (0-100, parallel-safe)
+
+
+def _occupancy(value, start, end, n):
+    """Union of each value's intervals (ms), so overlapping parallel/nested
+    intervals count once — always <= span. Grouped merge, vectorized per group."""
+    occ = np.zeros(n)
+    if len(value) == 0:
+        return occ
+    order = np.lexsort((start, value))  # by value, then start
+    vs = value[order]
+    ss = start[order]
+    ee = end[order]
+    change = np.flatnonzero(np.diff(vs)) + 1
+    g_start = np.concatenate(([0], change))
+    g_end = np.concatenate((change, [len(vs)]))
+    for gs, ge in zip(g_start, g_end):
+        s = ss[gs:ge]
+        e = ee[gs:ge]
+        run = np.maximum.accumulate(e)  # running max end within the group
+        prev = np.empty(ge - gs)
+        prev[0] = -np.inf
+        prev[1:] = run[:-1]
+        occ[vs[gs]] = np.maximum(0.0, e - np.maximum(s, prev)).sum()
+    return occ
 
 
 def compute(trace: TraceData, t0: float | None = None, t1: float | None = None):
@@ -34,9 +58,12 @@ def compute(trace: TraceData, t0: float | None = None, t1: float | None = None):
     if t0 is not None and t1 is not None:
         mask = (end > t0) & (start < t1)
         value = value[mask]
-        dur = np.minimum(end[mask], t1) - np.maximum(start[mask], t0)
+        s_clip = np.maximum(start[mask], t0)
+        e_clip = np.minimum(end[mask], t1)
+        dur = e_clip - s_clip
         span = max(t1 - t0, 1e-12)
     else:
+        s_clip, e_clip = start, end
         dur = end - start
         span = max(trace.tmax - trace.tmin, 1e-12)
 
@@ -46,6 +73,7 @@ def compute(trace: TraceData, t0: float | None = None, t1: float | None = None):
     np.maximum.at(vmax, value, dur)
     vmin = np.full(n, np.inf)
     np.minimum.at(vmin, value, dur)
+    occ = _occupancy(value, s_clip, e_clip, n)
 
     out = []
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -63,7 +91,7 @@ def compute(trace: TraceData, t0: float | None = None, t1: float | None = None):
                 mean=float(mean[v]),
                 min=float(vmin[v]),
                 max=float(vmax[v]),
-                percent=100.0 * float(total[v]) / span,
+                percent=100.0 * float(occ[v]) / span,
             )
         )
     out.sort(key=lambda s: s.total, reverse=True)
