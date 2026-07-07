@@ -14,7 +14,6 @@ from ngsolve_gui import cerbsim_style as cb
 # geometry shared with app.py
 LABEL_WIDTH = 176  # px, row-label column
 AXIS_HEIGHT = 26  # px, time-axis strip
-STATS_WIDTH = 560  # px, statistics panel
 
 css = StyleSheet(prefix="tv")
 
@@ -46,6 +45,11 @@ timeline_col = _cls(
     "tv-tcol", display="flex", flex_direction="column", flex="1",
     min_width="0", min_height="0",
 )
+# QSplitter panes default to overflow:auto (a stray scrollbar) and don't force
+# their child to fill the height — make them flex containers that clip, so the
+# canvas / stats table fill the pane exactly and manage their own scrolling.
+css.add_rule(".tv-mid .q-splitter, .tv-mid .q-splitter__panel", Style(min_height="0"))
+css.add_rule(".tv-mid .q-splitter__panel", Style(overflow="hidden", display="flex"))
 
 # ── top bar ──────────────────────────────────────────────────────────────────
 bar = _cls(
@@ -93,6 +97,14 @@ label_row.rule(".tv-swatch", margin_left="6px")
 canvas_wrap = _cls(
     "tv-canvas", position="relative", flex="1", min_width="0",
     overflow="hidden", background="var(--viewport)", cursor="crosshair",
+)
+
+# rubber-band time selection box (drag to zoom to a time range)
+sel_box = _cls(
+    "tv-sel", position="absolute", top="0", bottom="0", z_index="40",
+    pointer_events="none",
+    background="color-mix(in srgb, var(--accent) 20%, transparent)",
+    border_left="1px solid var(--accent)", border_right="1px solid var(--accent)",
 )
 
 # ── hover tooltip ────────────────────────────────────────────────────────────
@@ -154,9 +166,10 @@ load_title = _cls("tv-load-title", font_size="15px", font_weight="600", color="v
 load_bar = _cls("tv-load-bar", width="260px")
 
 # ── statistics panel ─────────────────────────────────────────────────────────
+# fills the QSplitter "after" pane (the splitter controls the width)
 stats = _cls(
-    "tv-stats", width=f"{STATS_WIDTH}px", flex="none", display="flex",
-    flex_direction="column", min_height="0",
+    "tv-stats", width="100%", height="100%", display="flex",
+    flex_direction="column", min_height="0", overflow="hidden",
     background="var(--panel)", border_left="1px solid var(--border)",
 )
 stats_head = _cls(

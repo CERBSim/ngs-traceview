@@ -1,6 +1,8 @@
 import math
 import os
+import re
 import threading
+import time
 
 from ngapp.app import App
 from ngapp.components import (
@@ -8,9 +10,12 @@ from ngapp.components import (
     FileUpload,
     QBtn,
     QBtnToggle,
+    QIcon,
+    QInput,
     QLinearProgress,
     QSpace,
     QSpinnerGears,
+    QSplitter,
     QTable,
     QTooltip,
     WebgpuComponent,
@@ -86,10 +91,17 @@ class TraceViewer(App):
         self._tick_pool = []
         self._label_pool = []
         self._drag_last = None
+        self._drag_mode = None  # "pan" | "select" | "back"
+        self._sel_start = 0
+        self._sel_moved = False
+        self._pan_pushed = False
+        self._history = []  # view snapshots for right-click "back"
+        self._last_wheel_push = 0.0
         self._hover_px = (0, 0)
         self._shown_pick = None  # interval idx currently in the tooltip
         self._hide_timer = None
         self._stats_open = False
+        self._stats_width = 460  # remembered panel width (px)
         self._stats_mode = "all"  # "all" | "view"
         self._stats_timer = None
         self._loading_path = None
@@ -116,15 +128,31 @@ class TraceViewer(App):
         )
         self.btn_fit.on_click(self._on_fit)
         self.btn_clear = QBtn(
-            QTooltip("Clear highlight"),
+            QTooltip("Clear highlight & search"),
             ui_icon="layers_clear", ui_flat=True, ui_dense=True, ui_round=True,
         )
-        self.btn_clear.on_click(lambda *_: self._set_highlight(None))
+        self.btn_clear.on_click(lambda *_: self._clear_highlight())
         self.btn_stats = QBtn(
             QTooltip("Toggle statistics"),
             ui_icon="bar_chart", ui_flat=True, ui_dense=True, ui_round=True,
         )
         self.btn_stats.on_click(self._toggle_stats)
+
+        # regex search: highlights every function whose name matches
+        self.search_input = QInput(
+            QTooltip("Highlight functions matching a regex (case-insensitive)"),
+            ui_model_value="",
+            ui_dense=True,
+            ui_outlined=True,
+            ui_clearable=True,
+            ui_debounce=200,
+            ui_hide_bottom_space=True,
+            ui_slots={"prepend": [QIcon(ui_name="search", ui_size="18px")]},
+            ui_style="width: 240px;",
+        )
+        # `placeholder` is a native <input> attribute, not a generated ui_ prop
+        self.search_input._props["placeholder"] = "highlight regex…"
+        self.search_input.on("update:model-value", self._on_search)
 
         self.info_label = Div("no trace loaded", ui_class=str(style.info))
 
@@ -138,6 +166,7 @@ class TraceViewer(App):
             self.file_input,
             self.btn_fit,
             self.btn_clear,
+            self.search_input,
             QSpace(),
             self.info_label,
             Div(ui_class=str(style.sep)),
@@ -150,7 +179,11 @@ class TraceViewer(App):
         self._labels = Div(ui_class=str(style.labels))
         self.canvas = WebgpuComponent(width="100%", height="100%", id="timeline_canvas")
         self.tooltip = self._build_tooltip()
-        canvas_wrap = Div(self.canvas, self.tooltip, ui_class=str(style.canvas_wrap))
+        self.sel_box = Div(ui_class=str(style.sel_box))
+        self.sel_box.ui_style = "display:none;"
+        canvas_wrap = Div(
+            self.canvas, self.sel_box, self.tooltip, ui_class=str(style.canvas_wrap)
+        )
         timeline_col = Div(
             self._axis,
             Div(self._labels, canvas_wrap, ui_class=str(style.body)),
@@ -158,12 +191,23 @@ class TraceViewer(App):
         )
 
         self.stats_panel = self._build_stats_panel()
-        self.stats_panel.ui_hidden = True
 
         self.loading = self._build_loading()
         self.loading.ui_hidden = True
 
-        mid = Div(timeline_col, self.stats_panel, self.loading, ui_class=str(style.mid))
+        # QSplitter makes the stats panel width draggable; reverse=True measures
+        # the right ("after") pane in px, and 0 collapses it (panel closed)
+        self.splitter = QSplitter(
+            ui_model_value=0,
+            ui_unit="px",
+            ui_reverse=True,
+            ui_limits=[0, 1000],
+            ui_emit_immediately=True,
+            ui_slots={"before": [timeline_col], "after": [self.stats_panel]},
+            ui_style="height:100%; width:100%;",
+        )
+        self.splitter.on("update:model-value", self._on_splitter)
+        mid = Div(self.splitter, self.loading, ui_class=str(style.mid))
 
         self.detail = Div(ui_class=str(style.detail))
         self.detail.ui_hidden = True
@@ -236,7 +280,7 @@ class TraceViewer(App):
             ui_row_key="id",
             ui_dense=True,
             ui_flat=True,
-            ui_selection="single",
+            ui_selection="multiple",
             ui_selected=[],
             ui_virtual_scroll=True,
             ui_pagination={"rowsPerPage": 0},
@@ -322,8 +366,8 @@ class TraceViewer(App):
         self._set_loading(False)
         self._refresh_stats()
         self.status.ui_children = [
-            "wheel: zoom time · ctrl+wheel: zoom rows · drag: pan · "
-            "hover: inspect · click: highlight"
+            "drag: zoom to range · right-click: back · shift/middle-drag: pan · "
+            "wheel: zoom · ctrl+wheel: zoom rows · click: highlight · dbl-click: fit"
         ]
 
     # ---- rendering ----
@@ -367,26 +411,89 @@ class TraceViewer(App):
 
     # ---- interaction ----
 
+    # -- view history (right-click steps back) --
+
+    def _push_history(self):
+        v = self.view
+        if v is None:
+            return
+        self._history.append((v.t0, v.t1, v.y0, v.rows_visible))
+        if len(self._history) > 500:
+            self._history.pop(0)
+
+    def _restore_previous(self):
+        if self.view is None or not self._history:
+            return
+        v = self.view
+        v.t0, v.t1, v.y0, v.rows_visible = self._history.pop()
+        v.apply()
+
     def _on_mousedown(self, ev):
-        self._drag_last = (ev["canvasX"], ev["canvasY"])
+        button = ev.get("button", 0)
+        if button == 2:  # right button: go back to the previous view
+            self._drag_mode = "back"
+            self._restore_previous()
+            return
+        x, y = ev["canvasX"], ev["canvasY"]
+        self._drag_last = (x, y)
+        # plain left-drag = rubber-band time zoom (ViTE); shift or middle = pan
+        pan = ev.get("shiftKey") or button == 1 or ev.get("buttons") == 4
+        self._drag_mode = "pan" if pan else "select"
+        self._sel_start = x
+        self._sel_moved = False
+        self._pan_pushed = False
 
     def _on_mouseup(self, ev):
+        if (
+            self.view is not None
+            and self._drag_mode == "select"
+            and self._sel_moved
+        ):
+            self._push_history()
+            a = self.view.time_at(min(self._sel_start, ev["canvasX"]))
+            b = self.view.time_at(max(self._sel_start, ev["canvasX"]))
+            self.view.set_time_range(a, b)
+            self.view.apply()
+        self._hide_selection()
         self._drag_last = None
+        self._drag_mode = None
 
     def _on_drag(self, ev):
         if self.view is None:
             return
         x, y = ev["canvasX"], ev["canvasY"]
-        if self._drag_last is not None:
-            self.view.pan_px(x - self._drag_last[0], y - self._drag_last[1])
-            self.view.apply()
-        self._drag_last = (x, y)
         self._cancel_hide()
         self._hide_now()
+        if self._drag_mode == "pan":
+            if not self._pan_pushed:  # one history entry per pan gesture
+                self._push_history()
+                self._pan_pushed = True
+            if self._drag_last is not None:
+                self.view.pan_px(x - self._drag_last[0], y - self._drag_last[1])
+                self.view.apply()
+            self._drag_last = (x, y)
+        elif self._drag_mode == "select":
+            if abs(x - self._sel_start) > 3:
+                self._sel_moved = True
+            self._show_selection(self._sel_start, x)
+
+    def _show_selection(self, x0_dev, x1_dev):
+        dpr = (self.view.scene.canvas.dpr if self.view.scene else 1) or 1
+        lo = min(x0_dev, x1_dev) / dpr
+        hi = max(x0_dev, x1_dev) / dpr
+        self.sel_box.ui_style = f"display:block; left:{lo:.0f}px; width:{hi - lo:.0f}px;"
+
+    def _hide_selection(self):
+        self.sel_box.ui_style = "display:none;"
 
     def _on_wheel(self, ev):
         if self.view is None:
             return
+        # coalesce a burst of wheel events into one history entry
+        now = time.time()
+        if now - self._last_wheel_push > 0.4:
+            self._push_history()
+        self._last_wheel_push = now
         factor = 2.0 ** (-ev.get("deltaY", 0) / 240.0)
         if ev.get("ctrlKey"):
             self.view.zoom_rows(ev["canvasY"], factor)
@@ -400,6 +507,7 @@ class TraceViewer(App):
     def _on_fit(self, *_):
         if self.view is None:
             return
+        self._push_history()
         self.view.fit()
         self.view.apply()
 
@@ -407,10 +515,47 @@ class TraceViewer(App):
         if self.view is not None:
             self.view.set_highlight(value)
 
+    def _clear_highlight(self, *_):
+        self.search_input.ui_model_value = ""
+        self.search_input.ui_error = False
+        self._set_highlight(None)
+        self._sync_stats_selection(None)
+
+    # ---- regex search highlight ----
+
+    def _on_search(self, ev):
+        text = ev.value if hasattr(ev, "value") else ev
+        text = (text or "").strip()
+        if self.trace is None or self.view is None:
+            return
+        if not text:
+            self.search_input.ui_error = False
+            self._set_highlight(None)
+            self._sync_stats_selection(None)
+            return
+        try:
+            rx = re.compile(text, re.IGNORECASE)
+        except re.error:
+            self.search_input.ui_error = True  # invalid regex: leave view as is
+            return
+        self.search_input.ui_error = False
+        matches = [i for i, name in enumerate(self.trace.names) if rx.search(name)]
+        self._set_highlight(matches or None)
+        if self._stats_open:
+            self.stats_table.ui_selected = []  # search drives the highlight now
+        self.status.ui_children = [
+            f"/{text}/  ·  {len(matches)} of {len(self.trace.names)} functions highlighted"
+        ]
+
     # ---- hover tooltip (GPU picking) ----
 
     def _on_hover(self, ev):
         if self.view is None:
+            return
+        # during a drag (button held) skip GPU picking — the "mousemove" event
+        # fires alongside "drag", and a select round-trip per move would clog
+        # the link and starve the drag/mouseup events
+        if self._drag_mode in ("pan", "select", "back") or ev.get("buttons"):
             return
         self._hover_px = (ev["canvasX"], ev["canvasY"])
         self.canvas.select(ev["canvasX"], ev["canvasY"])
@@ -464,16 +609,33 @@ class TraceViewer(App):
             self.status.ui_children = [
                 f"{row_name}:  {format_duration(end - start)}  —  {name[:140]}"
             ]
-        # reposition every move (cheap single-node style update, no rebuild)
-        dpr = self.view.scene.canvas.dpr or 1
+        # reposition every move (cheap single-node style update, no rebuild).
+        # Flip above / left of the cursor near the bottom / right edges so the
+        # tooltip is never clipped by the canvas area (e.g. on the last rows).
+        canvas = self.view.scene.canvas
+        dpr = canvas.dpr or 1
+        w, h = canvas.width / dpr, canvas.height / dpr
         x, y = self._hover_px[0] / dpr, self._hover_px[1] / dpr
-        self.tooltip.ui_style = f"display:block; left:{x + 14:.0f}px; top:{y + 14:.0f}px;"
+        if x > w * 0.62:
+            left, tx = x - 14, "-100%"
+        else:
+            left, tx = x + 14, "0"
+        if y > h * 0.6:
+            top, ty = y - 14, "-100%"
+        else:
+            top, ty = y + 14, "0"
+        self.tooltip.ui_style = (
+            f"display:block; left:{left:.0f}px; top:{top:.0f}px; "
+            f"transform: translate({tx}, {ty});"
+        )
 
     def _on_pick_background(self, sel_ev):
         self._schedule_hide()
 
     def _on_click(self, ev):
-        """Click a block: highlight that function and pin its details."""
+        """Left-click a block: highlight that function and pin its details."""
+        if ev.get("button", 0) != 0:  # right-click is handled as "go back"
+            return
         trace = self.trace
         idx = self._shown_pick
         if trace is None or idx is None:
@@ -518,9 +680,24 @@ class TraceViewer(App):
     # ---- statistics panel ----
 
     def _toggle_stats(self, *_):
-        self._stats_open = not self._stats_open
-        self.stats_panel.ui_hidden = not self._stats_open
+        # drive the splitter: 0 = closed, remembered width = open
+        opening = not self._stats_open
+        self.splitter.ui_model_value = self._stats_width if opening else 0
+        self._stats_open = opening
+        if opening:
+            self._refresh_stats()
+
+    def _on_splitter(self, ev):
+        val = ev.value if hasattr(ev, "value") else ev
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            return
+        was_open = self._stats_open
+        self._stats_open = val > 24
         if self._stats_open:
+            self._stats_width = val
+        if self._stats_open and not was_open:
             self._refresh_stats()
 
     def _on_stats_mode(self, ev):
@@ -568,12 +745,10 @@ class TraceViewer(App):
 
     def _on_stats_select(self, ev):
         selected = ev.value if hasattr(ev, "value") else ev
-        self.stats_table.ui_selected = selected or []
-        if selected:
-            value = int(selected[0]["value"])
-            self._set_highlight(value)
-        else:
-            self._set_highlight(None)
+        selected = selected or []
+        self.stats_table.ui_selected = selected
+        values = [int(r["value"]) for r in selected]
+        self._set_highlight(values if values else None)
 
     def _sync_stats_selection(self, value):
         """Reflect a timeline highlight in the stats table selection."""

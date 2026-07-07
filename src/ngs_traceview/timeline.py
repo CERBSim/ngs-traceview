@@ -8,9 +8,11 @@ import numpy as np
 from webgpu.renderer import Renderer, RenderOptions
 from webgpu.uniforms import UniformBase
 from webgpu.utils import (
+    BufferBinding,
     buffer_from_array,
     read_shader_file,
     register_shader_directory,
+    write_array_to_buffer,
 )
 from webgpu.webgpu_api import (
     BufferUsage,
@@ -31,9 +33,6 @@ ROW_PAD = 0.05
 DEPTH_INSET = 0.12
 
 
-NO_HIGHLIGHT = 0xFFFFFFFF
-
-
 class TimelineUniforms(UniformBase):
     """Must match TimelineUniforms in shaders/timeline.wgsl."""
 
@@ -47,12 +46,12 @@ class TimelineUniforms(UniformBase):
         ("min_w", ct.c_float),
         ("canvas_w", ct.c_float),
         ("canvas_h", ct.c_float),
-        ("highlight", ct.c_uint32),
+        ("highlight", ct.c_uint32),  # 1 = a selection is active (dim non-selected)
         ("_pad", ct.c_uint32 * 3),
     ]
 
     def __init__(self, **kwargs):
-        super().__init__(highlight=NO_HIGHLIGHT, **kwargs)
+        super().__init__(highlight=0, **kwargs)
 
 
 _INSTANCE_DTYPE = np.dtype(
@@ -81,7 +80,35 @@ class TimelineRenderer(Renderer):
         super().__init__(label="timeline")
         self.uniforms = TimelineUniforms()
         self._instance_buffer = None
+        self.sel_buffer = None  # per-value 0/1 selection mask (for highlight)
         self.set_trace(trace)
+
+    def _ensure_sel_buffer(self):
+        if self.sel_buffer is None:
+            mask = np.zeros(len(self.trace.names), dtype=np.uint32)
+            self.sel_buffer = buffer_from_array(
+                mask, usage=BufferUsage.STORAGE | BufferUsage.COPY_DST,
+                label="timeline selection",
+            )
+
+    def set_selection(self, values):
+        """Highlight a set of entity-value ids (dim the rest); None/empty clears.
+
+        Accepts a single id, an iterable of ids, or None.
+        """
+        self._ensure_sel_buffer()
+        n = len(self.trace.names)
+        mask = np.zeros(n, dtype=np.uint32)
+        active = 0
+        if values is not None:
+            if isinstance(values, (int, np.integer)):
+                values = [int(values)]
+            vals = [int(v) for v in values if 0 <= int(v) < n]
+            if vals:
+                mask[vals] = 1
+                active = 1
+        write_array_to_buffer(self.sel_buffer, mask)
+        self.uniforms.highlight = active
 
     def set_trace(self, trace: TraceData):
         self.trace = trace
@@ -90,6 +117,7 @@ class TimelineRenderer(Renderer):
         self.set_needs_update()
 
     def update(self, options: RenderOptions):
+        self._ensure_sel_buffer()
         # update() runs once per frame in the legacy render path — only
         # rebuild the (large) instance buffer when the trace data changed
         if not self._data_dirty:
@@ -131,7 +159,10 @@ class TimelineRenderer(Renderer):
         self._data_dirty = False
 
     def get_bindings(self):
-        return self.uniforms.get_bindings()
+        self._ensure_sel_buffer()
+        return self.uniforms.get_bindings() + [
+            BufferBinding(61, self.sel_buffer, read_only=True)
+        ]
 
     def get_shader_code(self):
         return read_shader_file("ngs_traceview/timeline.wgsl")
@@ -192,11 +223,9 @@ class TimelineView:
 
     # -- view manipulation --
 
-    def set_highlight(self, value):
-        """Highlight one entity-value id (dim the rest); None clears."""
-        self.renderer.uniforms.highlight = (
-            NO_HIGHLIGHT if value is None else int(value)
-        )
+    def set_highlight(self, values):
+        """Highlight a set of entity-value ids (dim the rest); None clears."""
+        self.renderer.set_selection(values)
         self.apply()
 
     def fit(self):
@@ -217,6 +246,16 @@ class TimelineView:
         f = (t_fix - self.t0) / self.span
         self.t0 = t_fix - f * new_span
         self.t1 = self.t0 + new_span
+        self._clamp()
+
+    def set_time_range(self, a: float, b: float):
+        """Zoom the time axis to the window [a, b] (ms); rows unchanged."""
+        if b < a:
+            a, b = b, a
+        full = max(self.trace.tmax - self.trace.tmin, 1.0)
+        span = min(max(b - a, self.MIN_SPAN), 4 * full)
+        self.t0 = a
+        self.t1 = a + span
         self._clamp()
 
     def zoom_rows(self, py: float, factor: float):

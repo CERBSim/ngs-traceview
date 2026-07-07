@@ -10,9 +10,9 @@ Times in the file are in milliseconds (ngcore ConvertTime).
 """
 
 import dataclasses
-import multiprocessing as mp
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -32,7 +32,13 @@ SET_STATE = 11
 PUSH_STATE = 12
 POP_STATE = 13
 
-_CHUNK = 1 << 20  # batch-convert push/pop columns every ~1M events
+# ASCII byte constants used by the vectorized reader
+_NL = 10  # \n
+_TAB = 9  # \t
+_C1 = ord("1")
+_C2 = ord("2")
+_C3 = ord("3")
+_PCT = ord("%")
 
 
 def _unquote(s: bytes) -> str:
@@ -85,125 +91,156 @@ class TraceData:
         return len(self.start)
 
 
-class _PushPopAccumulator:
-    """Collects push/pop event columns and batch-converts them to numpy."""
-
-    def __init__(self):
-        self._t: list[bytes] = []
-        self._cont: list[bytes] = []
-        self._val: list[bytes] = []  # b"" marks a pop
-        self.t_parts: list[np.ndarray] = []
-        self.cont_parts: list[np.ndarray] = []
-        self.val_parts: list[np.ndarray] = []
-
-    def push(self, t: bytes, cont: bytes, val: bytes):
-        self._t.append(t)
-        self._cont.append(cont)
-        self._val.append(val)
-        if len(self._t) >= _CHUNK:
-            self._flush()
-
-    def pop(self, t: bytes, cont: bytes):
-        self.push(t, cont, b"")
-
-    def _flush(self):
-        if not self._t:
-            return
-        self.t_parts.append(np.asarray(self._t).astype(np.float64))
-        self.cont_parts.append(np.asarray(self._cont))
-        self.val_parts.append(np.asarray(self._val))
-        self._t.clear()
-        self._cont.clear()
-        self._val.clear()
-
-    def arrays(self):
-        self._flush()
-        if not self.t_parts:
-            empty_s = np.asarray([], dtype="S1")
-            return np.empty(0), empty_s, empty_s
-        t = np.concatenate(self.t_parts)
-        # concatenate with a common (max) itemsize
-        cont = np.concatenate([p.astype(max(p.dtype for p in self.cont_parts)) for p in self.cont_parts])
-        val = np.concatenate([p.astype(max(p.dtype for p in self.val_parts)) for p in self.val_parts])
-        return t, cont, val
+def _gather(sub, starts, ends):
+    """Extract the variable-length byte ranges ``sub[starts[i]:ends[i]]`` into a
+    fixed-width ``S`` array (null-padded). Pure numpy, so it releases the GIL and
+    parallelizes across threads."""
+    lens = ends - starts
+    lens[lens < 0] = 0
+    W = int(lens.max()) if len(lens) else 1
+    W = max(W, 1)
+    j = np.arange(W)
+    src = starts[:, None] + j
+    valid = j < lens[:, None]
+    g = np.where(valid, sub[np.clip(src, 0, len(sub) - 1)], 0).astype(np.uint8)
+    return np.ascontiguousarray(g).view(f"S{W}").ravel()
 
 
-def _classify(line: bytes, acc: "_PushPopAccumulator", meta: list):
-    """Route one raw line to the push/pop accumulator or the meta bucket."""
-    code = line[: line.find(b"\t")]
-    if code == b"12":
-        p = line.split(b"\t")
-        acc.push(p[1], p[3], p[4])
-    elif code == b"13":
-        p = line.split(b"\t")
-        acc.pop(p[1], p[3].rstrip())
-    elif line[:1] == b"%":
-        return
-    else:
-        meta.append(line)
+def _extract_chunk(buf, start, end):
+    """Vectorized parse of a newline-aligned byte range into push/pop columns.
 
-
-def _parse_range(args):
-    """Worker: parse byte range [start, end) of the trace file.
-
-    Runs in a forked child; touches only ``open()`` + numpy, so it is safe to
-    fork from the (threaded) app server. Returns push/pop columns + meta lines.
+    Returns ``(time float64, container S, value S, meta_lines)`` for the chunk.
+    Value is ``b""`` for pop events (matches the pairing code's push detection).
     """
-    path, start, end = args
-    acc = _PushPopAccumulator()
-    meta: list[bytes] = []
-    with open(path, "rb") as f:
-        if start:
-            # discard the line straddling the start boundary (owned by the
-            # previous chunk); seek to start-1 so an exact boundary consumes
-            # only the trailing newline, never a whole valid line.
-            f.seek(start - 1)
-            f.readline()
-        while f.tell() < end:
-            line = f.readline()
-            if not line:
-                break
-            _classify(line, acc, meta)
-    return (*acc.arrays(), meta)
+    sub = buf[start:end]
+    m = len(sub)
+    empty = np.asarray([], dtype="S1")
+    if m == 0:
+        return np.empty(0), empty, empty, []
+
+    nl = np.flatnonzero(sub == _NL)
+    ls = np.empty(len(nl) + 1, np.int64)
+    ls[0] = 0
+    ls[1:] = nl + 1
+    if ls[-1] >= m:
+        ls = ls[:-1]
+    L = len(ls)
+    line_end = np.empty(L, np.int64)
+    line_end[: len(nl)] = nl
+    if L > len(nl):
+        line_end[-1] = m  # last line without a trailing newline
+
+    c0 = sub[ls]
+    c1 = sub[np.minimum(ls + 1, m - 1)]
+    c2 = sub[np.minimum(ls + 2, m - 1)]
+    is_pp = (c0 == _C1) & ((c1 == _C2) | (c1 == _C3)) & (c2 == _TAB)
+
+    # the few non-event, non-comment lines (defines / creates / variables)
+    meta_idx = np.flatnonzero((~is_pp) & (c0 != _PCT))
+    meta = [sub[ls[k] : line_end[k]].tobytes() for k in meta_idx]
+
+    sel = np.flatnonzero(is_pp)
+    if len(sel) == 0:
+        return np.empty(0), empty, empty, meta
+
+    tabs = np.flatnonzero(sub == _TAB)
+    ntab = len(tabs)
+    ft = np.searchsorted(tabs, ls)[sel]  # index of each line's first tab
+    end_s = line_end[sel]
+    push = c1[sel] == _C2
+
+    # drop incomplete trailing lines (need at least 3 tabs before the newline —
+    # e.g. a byte-truncated last line); complete files keep every event
+    ok = (ft + 2 < ntab) & (tabs[np.minimum(ft + 2, ntab - 1)] < end_s)
+    if not ok.all():
+        keep = np.flatnonzero(ok)
+        sel, ft, end_s, push = sel[keep], ft[keep], end_s[keep], push[keep]
+        if len(sel) == 0:
+            return np.empty(0), empty, empty, meta
+
+    BIG = np.iinfo(np.int64).max
+    t0 = tabs[ft]
+    t1 = tabs[ft + 1]
+    t2 = tabs[ft + 2]
+    t3 = tabs[np.minimum(ft + 3, ntab - 1)]
+    # value's closing tab; when the line has no 5th tab the value runs to the
+    # newline, so use a sentinel that min()s down to end_s
+    t4 = np.where(ft + 4 < ntab, tabs[np.minimum(ft + 4, ntab - 1)], BIG)
+
+    # time = field 1 (tab0..tab1); container = field 3 (tab2..tab3 for push, else
+    # to newline); value = field 4 (push only, tab3..tab4-or-newline)
+    tvals = _gather(sub, t0 + 1, t1).astype(np.float64)
+    cont = _gather(sub, t2 + 1, np.where(push, t3, end_s))
+    vstart = np.where(push, t3 + 1, end_s)
+    vend = np.where(push, np.minimum(t4, end_s), end_s)
+    val = _gather(sub, vstart, vend)
+    return tvals, cont, val, meta
 
 
-def _read_events_serial(path, progress):
-    acc = _PushPopAccumulator()
-    meta: list[bytes] = []
-    with open(path, "rb") as f:
-        for line in f:
-            _classify(line, acc, meta)
+def _newline_bounds(data, n, chunks):
+    """Byte offsets partitioning ``data`` into ``chunks`` newline-aligned pieces."""
+    bounds = [0]
+    for i in range(1, chunks):
+        p = data.find(b"\n", n * i // chunks)
+        bounds.append(p + 1 if p >= 0 else n)
+    bounds.append(n)
+    out = [0]
+    for b in bounds[1:]:
+        if b > out[-1]:
+            out.append(b)
+    return out
+
+
+def _read_events(path, progress=None):
+    """Read push/pop columns + meta lines with a vectorized numpy parser.
+
+    The file is split into newline-aligned byte ranges parsed by
+    :func:`_extract_chunk`; the numpy ops release the GIL, so a plain
+    ``ThreadPoolExecutor`` parallelizes them — no worker processes, so nothing
+    inherits the app's websocket/event-loop state (which broke fork on macOS).
+    """
     if progress:
-        progress(0.8, "parsing events")
-    return (*acc.arrays(), meta)
+        progress(0.05, "reading file")
+    with open(path, "rb") as f:
+        data = f.read()
+    buf = np.frombuffer(data, dtype=np.uint8)
+    n = len(data)
 
+    try:
+        workers = min(os.cpu_count() or 1, 8)
+    except Exception:
+        workers = 1
+    if n < 4 * 1024 * 1024:
+        workers = 1
 
-def _read_events_parallel(path, progress, workers):
-    size = os.path.getsize(path)
-    nchunks = workers
-    bounds = [size * i // nchunks for i in range(nchunks + 1)]
-    tasks = [(path, bounds[i], bounds[i + 1]) for i in range(nchunks)]
-    results = [None] * nchunks
+    bounds = _newline_bounds(data, n, workers)
+    total = len(bounds) - 1
+    results = [None] * total
 
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    ctx = mp.get_context("fork")
-    done = 0
-    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-        futs = {ex.submit(_parse_range, t): i for i, t in enumerate(tasks)}
-        for fut in as_completed(futs):
-            results[futs[fut]] = fut.result()
-            done += 1
-            if progress:
-                progress(0.05 + 0.75 * done / nchunks,
-                         f"parsing events · {done}/{nchunks} chunks")
+    if total == 1:
+        results[0] = _extract_chunk(buf, bounds[0], bounds[1])
+        if progress:
+            progress(0.8, "parsing events")
+    else:
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(_extract_chunk, buf, bounds[i], bounds[i + 1]): i
+                for i in range(total)
+            }
+            for fut in as_completed(futs):
+                results[futs[fut]] = fut.result()
+                done += 1
+                if progress:
+                    progress(0.1 + 0.7 * done / total,
+                             f"parsing events · {done}/{total} chunks")
 
     ts, cs, vs, meta = [], [], [], []
-    for t, c, v, m in results:
-        if len(t):
-            ts.append(t)
-            cs.append(c)
-            vs.append(v)
+    for tv, cont, val, m in results:  # in file order
+        if len(tv):
+            ts.append(tv)
+            cs.append(cont)
+            vs.append(val)
         meta.extend(m)
     if not ts:
         empty = np.asarray([], dtype="S1")
@@ -214,21 +251,6 @@ def _read_events_parallel(path, progress, workers):
     cont = np.concatenate([a.astype(f"S{cw}") for a in cs])
     val = np.concatenate([a.astype(f"S{vw}") for a in vs])
     return t, cont, val, meta
-
-
-def _read_events(path, progress=None):
-    """Read push/pop events + meta lines, in parallel when possible."""
-    try:
-        workers = min(os.cpu_count() or 1, 16)
-    except Exception:
-        workers = 1
-    # only worth forking for reasonably large files
-    if workers > 1 and os.path.getsize(path) > 8 * 1024 * 1024:
-        try:
-            return _read_events_parallel(path, progress, workers)
-        except Exception as e:  # pragma: no cover - defensive fallback
-            print(f"parallel parse failed ({e!r}); falling back to serial")
-    return _read_events_serial(path, progress)
 
 
 def _process_meta(meta_lines):

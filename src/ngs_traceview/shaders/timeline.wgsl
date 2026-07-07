@@ -15,7 +15,7 @@ struct TimelineUniforms {
   min_w: f32,    // minimum rectangle width in NDC units (~1 px)
   canvas_w: f32, // canvas size in device pixels
   canvas_h: f32,
-  highlight: u32, // entity-value id to highlight (0xffffffff = none)
+  highlight: u32, // 1 = a selection is active -> dim everything not in u_sel
   // three scalar u32 pads (NOT vec3<u32> — that has 16-byte alignment and
   // would round the struct up to 64 bytes, mismatching the 48-byte host buffer)
   _pad0: u32,
@@ -24,6 +24,8 @@ struct TimelineUniforms {
 };
 
 @group(0) @binding(60) var<uniform> u_view : TimelineUniforms;
+// per-entity-value selection mask (0/1), indexed by an interval's value id
+@group(0) @binding(61) var<storage, read> u_sel : array<u32>;
 
 struct VertexIn {
   @builtin(vertex_index) vi: u32,
@@ -83,8 +85,8 @@ fn fragment_timeline(in: VertexOut) -> @location(0) vec4f {
       rgb *= 0.55;
     }
   }
-  // when a function is highlighted, fade everything else toward neutral grey
-  if (u_view.highlight != 0xffffffffu && in.value != u_view.highlight) {
+  // when a selection is active, fade everything not selected toward neutral grey
+  if (u_view.highlight != 0u && u_sel[in.value] == 0u) {
     let lum = dot(rgb, vec3f(0.299, 0.587, 0.114));
     rgb = mix(vec3f(lum), rgb, 0.15);
     rgb = mix(rgb, vec3f(0.6), 0.6);

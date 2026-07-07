@@ -17,9 +17,11 @@ python -m ngs_traceview mytrace.trace    # equivalent (module form)
 
 | input | action |
 | --- | --- |
+| left drag | draw a box → zoom to that time range |
+| right click | step back to the previous view (undo a zoom/pan) |
+| shift-drag / middle-drag | pan |
 | mouse wheel | zoom time axis (at cursor) |
 | ctrl + wheel | zoom rows (at cursor) |
-| left drag | pan |
 | hover | tooltip with task name and duration |
-| click | pin task details + aggregate statistics in the bottom panel |
+| click | highlight that function + pin details/stats |
 | double click / fit button | zoom to full trace |
