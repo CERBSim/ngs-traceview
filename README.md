@@ -26,10 +26,21 @@ ShowTrace("mytrace.trace")               # embeds the full viewer in the cell
 | --- | --- |
 | left drag | draw a box → zoom to that time range |
 | right click | step back to the previous view (undo a zoom/pan) |
-| shift-drag / middle-drag | pan |
+| middle-drag / shift-drag / two-finger swipe | pan |
 | mouse wheel | zoom time axis (at cursor) |
 | ctrl + wheel | zoom rows (at cursor) |
 | hover | tooltip with task name and duration |
 | click | show the task's info in the bottom bar |
 | double click | highlight that function, dim everything else |
-| fit button (toolbar) | zoom to the full trace |
+
+### Keyboard
+
+| key | action |
+| --- | --- |
+| space / f | zoom to the full trace |
+| backspace | step back to the previous view |
+| escape | clear highlight / search |
+| s | toggle the statistics panel |
+| / or ctrl/⌘+f | focus the search box |
+| + / − | zoom in / out (centred) |
+| arrow keys | pan (←→ time, ↑↓ rows) |

@@ -109,6 +109,87 @@ class TraceViewer(App):
 
         self.canvas.on_mounted(self._on_canvas_mounted)
         self.on_mounted(self._apply_quasar_dark)
+        self._setup_keybindings()
+
+    # ---- keybindings ----
+
+    def _setup_keybindings(self):
+        # hotkeys-js: single/named keys; auto-ignored while typing in inputs
+        keys = {
+            "space": self._on_fit,                       # zoom to full trace
+            "f": self._on_fit,
+            "backspace": self._restore_previous,         # back (undo zoom/pan)
+            "escape": self._clear_highlight,             # clear highlight/search
+            "s": self._toggle_stats,                     # statistics panel
+            "=": lambda: self._key_zoom(1.4),            # zoom in (centre)
+            "+": lambda: self._key_zoom(1.4),
+            "-": lambda: self._key_zoom(1 / 1.4),        # zoom out
+            "left": lambda: self._key_pan(90, 0),        # pan earlier
+            "right": lambda: self._key_pan(-90, 0),      # pan later
+            "up": lambda: self._key_pan(0, 90),          # pan rows
+            "down": lambda: self._key_pan(0, -90),
+        }
+        for key, fn in keys.items():
+            self.add_keybinding(key, self._make_key_handler(fn))
+
+    def _make_key_handler(self, fn):
+        # the keybinding callback is invoked with the event; our actions take no
+        # args. (preventDefault can't be done here — over the websocket link it
+        # is async and fires too late; keys that need it are handled in JS via
+        # _install_search_keys.)
+        def handler(ev=None):
+            fn()
+        return handler
+
+    def _blur_search(self):
+        try:
+            self.search_input._js_call_method("blur")
+        except Exception:
+            pass
+
+    _SEARCH_KEYS_JS = r"""(function(){
+      if (window.__tvSearchKeys) return;
+      window.__tvSearchKeys = true;
+      function editable(el){ return el && (el.tagName === 'INPUT' ||
+        el.tagName === 'TEXTAREA' || el.isContentEditable); }
+      document.addEventListener('keydown', function(e){
+        var f = document.querySelector('.tv-search input');
+        if (!f) return;
+        var find = (e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F');
+        var slash = e.key === '/' && !editable(document.activeElement);
+        if (find || slash) { e.preventDefault(); f.focus(); f.select(); }
+        else if (e.key === 'Escape' && document.activeElement === f) { f.blur(); }
+      });
+    })();"""
+
+    def _install_search_keys(self):
+        # Focus the search box on '/', Ctrl/Cmd+F (preventing the browser's find
+        # bar) and blur it on Escape — all in JS, because preventDefault must be
+        # synchronous and can't be driven from Python over the websocket link.
+        def _run(js):
+            try:
+                js.eval(self._SEARCH_KEYS_JS)
+            except Exception:
+                pass
+
+        try:
+            self.call_js(_run)
+        except Exception:
+            pass
+
+    def _key_zoom(self, factor):
+        if self.view is None:
+            return
+        self._push_history()
+        w = self.view.scene.canvas.width if self.view.scene else 800
+        self.view.zoom_time(w / 2, factor)
+        self.view.apply()
+
+    def _key_pan(self, dx, dy):
+        if self.view is None:
+            return
+        self.view.pan_px(dx, dy)
+        self.view.apply()
 
     # ---- UI construction ----
 
@@ -149,11 +230,13 @@ class TraceViewer(App):
             ui_debounce=200,
             ui_hide_bottom_space=True,
             ui_slots={"prepend": [QIcon(ui_name="search", ui_size="18px")]},
+            ui_class="tv-search",
             ui_style="width: 240px;",
         )
         # `placeholder` is a native <input> attribute, not a generated ui_ prop
         self.search_input._props["placeholder"] = "highlight regex…"
         self.search_input.on("update:model-value", self._on_search)
+        self.search_input.on_mounted(self._install_search_keys)
 
         self.info_label = Div("no trace loaded", ui_class=str(style.info))
 
@@ -433,6 +516,10 @@ class TraceViewer(App):
         v.apply()
 
     def _on_mousedown(self, ev):
+        # interacting with the view drops focus from the search box (the canvas
+        # preventDefaults the click, so the browser won't blur it for us) — so
+        # keyboard shortcuts like space work again
+        self._blur_search()
         button = ev.get("button", 0)
         if button == 2:  # right button: go back to the previous view
             self._drag_mode = "back"
