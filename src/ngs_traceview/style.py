@@ -12,8 +12,8 @@ from ngapp.style import Style, StyleSheet
 from ngsolve_gui import cerbsim_style as cb
 
 # geometry shared with app.py
-LABEL_WIDTH = 176  # px, row-label column
-AXIS_HEIGHT = 26  # px, time-axis strip
+LABEL_WIDTH = 200  # px, row-label column
+AXIS_HEIGHT = 30  # px, time-axis strip
 
 css = StyleSheet(prefix="tv")
 
@@ -59,12 +59,12 @@ bar = _cls(
 )
 brand = _cls("tv-brand", display="flex", flex_direction="column", line_height="1.15",
              padding_right="6px")
-brand_name = _cls("tv-brand-name", font_size="15px", font_weight="700",
+brand_name = _cls("tv-brand-name", font_size="17px", font_weight="700",
                   letter_spacing="var(--ls-snug)", color="var(--fg)")
-brand_sub = _cls("tv-brand-sub", font_size="9px", letter_spacing="0.08em",
+brand_sub = _cls("tv-brand-sub", font_size="10px", letter_spacing="0.08em",
                  text_transform="uppercase", color="var(--fg-subtle)")
 sep = _cls("tv-sep", width="1px", height="26px", background="var(--border)", margin="0 2px")
-info = _cls("tv-info", font_family="var(--font-mono)", font_size="11.5px",
+info = _cls("tv-info", font_family="var(--font-mono)", font_size="13px",
             color="var(--fg-subtle)", white_space="nowrap")
 
 # ── time axis ────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ tick = _cls(
     "tv-tick", position="absolute", bottom="4px", transform="translateX(-50%)",
     white_space="nowrap", padding_left="5px",
     border_left="1px solid var(--border-strong)",
-    font_family="var(--font-mono)", font_size="10px", color="var(--fg-muted)",
+    font_family="var(--font-mono)", font_size="12px", color="var(--fg-muted)",
 )
 
 # ── body: labels + canvas ────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ label_row = _cls(
     "tv-label", position="absolute", right="8px", display="flex",
     align_items="center", justify_content="flex-end", white_space="nowrap",
     overflow="hidden", text_overflow="ellipsis",
-    font_size="11.5px", color="var(--fg-muted)",
+    font_size="13px", color="var(--fg-muted)",
 )
 label_row.rule(".tv-swatch", margin_left="6px")
 canvas_wrap = _cls(
@@ -110,15 +110,15 @@ sel_box = _cls(
 # ── hover tooltip ────────────────────────────────────────────────────────────
 tooltip = _cls(
     "tv-tip", position="absolute", z_index="60", pointer_events="none",
-    max_width="460px", padding="7px 10px",
+    max_width="560px", padding="10px 13px",
     background="var(--surface)", color="var(--fg)",
     border="1px solid var(--border-strong)", border_radius="var(--r-md)",
     box_shadow="var(--shadow-pop)",
 )
-tip_title = _cls("tv-tip-title", font_family="var(--font-mono)", font_size="11.5px",
+tip_title = _cls("tv-tip-title", font_family="var(--font-mono)", font_size="16px",
                  font_weight="600", color="var(--fg)", overflow_wrap="anywhere")
-tip_sub = _cls("tv-tip-sub", margin_top="3px", font_size="11.5px", color="var(--fg-muted)",
-               display="flex", align_items="center", gap="7px")
+tip_sub = _cls("tv-tip-sub", margin_top="5px", font_size="15px", color="var(--fg-muted)",
+               display="flex", align_items="center", gap="8px")
 
 # ── swatch (color chip) ──────────────────────────────────────────────────────
 swatch = _cls(
@@ -131,21 +131,21 @@ detail = _cls(
     "tv-detail", display="flex", align_items="center", gap="12px", flex="none",
     height="46px", padding="0 12px", overflow="hidden",
     background="var(--panel)", border_top="1px solid var(--border)",
-    font_size="12px", color="var(--fg)",
+    font_size="14px", color="var(--fg)",
 )
-detail_name = _cls("tv-detail-name", font_family="var(--font-mono)", font_size="11px",
+detail_name = _cls("tv-detail-name", font_family="var(--font-mono)", font_size="12.5px",
                    color="var(--fg)", white_space="nowrap", overflow="hidden",
                    text_overflow="ellipsis", flex="1", min_width="0")
-detail_meta = _cls("tv-detail-meta", font_family="var(--font-mono)", font_size="11.5px",
+detail_meta = _cls("tv-detail-meta", font_family="var(--font-mono)", font_size="13px",
                    color="var(--fg-muted)", white_space="nowrap")
-detail_hint = _cls("tv-detail-hint", color="var(--fg-faint)", font_size="12px")
+detail_hint = _cls("tv-detail-hint", color="var(--fg-faint)", font_size="14px")
 
 # ── status bar ───────────────────────────────────────────────────────────────
 status = _cls(
     "tv-status", display="flex", align_items="center", gap="8px", flex="none",
-    height="24px", padding="0 12px",
+    height="30px", padding="0 14px",
     background="var(--panel-header)", border_top="1px solid var(--border)",
-    font_family="var(--font-mono)", font_size="11px", color="var(--fg-subtle)",
+    font_family="var(--font-mono)", font_size="14.5px", color="var(--fg-subtle)",
     white_space="nowrap", overflow="hidden",
 )
 
@@ -164,7 +164,7 @@ load_card = _cls(
 )
 load_msg = _cls("tv-load-msg", font_size="13px", color="var(--fg-muted)",
                 font_family="var(--font-mono)")
-load_title = _cls("tv-load-title", font_size="15px", font_weight="600", color="var(--fg)")
+load_title = _cls("tv-load-title", font_size="17px", font_weight="600", color="var(--fg)")
 load_bar = _cls("tv-load-bar", width="260px")
 
 # ── statistics panel ─────────────────────────────────────────────────────────
@@ -180,7 +180,7 @@ stats_head = _cls(
     background="var(--panel-header)", border_bottom="1px solid var(--border)",
 )
 stats_title = _cls(
-    "tv-stats-title", font_size="11px", font_weight="700", letter_spacing="0.07em",
+    "tv-stats-title", font_size="12.5px", font_weight="700", letter_spacing="0.07em",
     text_transform="uppercase", color="var(--fg-muted)",
 )
 stats_body = _cls("tv-stats-body", position="relative", flex="1", min_height="0")
@@ -189,7 +189,7 @@ css.add_rule(".tv-stats-body .q-table__container", Style(height="100%"))
 css.add_rule(".tv-stats-body .q-table th",
              Style(font_weight="600", color="var(--fg-muted)", white_space="nowrap"))
 css.add_rule(".tv-stats-body .q-table tbody td",
-             Style(font_family="var(--font-mono)", font_size="11.5px"))
+             Style(font_family="var(--font-mono)", font_size="13px"))
 css.add_rule(".tv-stats-body .q-table tbody tr",
              Style(cursor="pointer"))
 # clamp the (long C++ symbol) Function column so the numeric columns stay visible

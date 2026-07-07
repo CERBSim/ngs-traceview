@@ -368,8 +368,9 @@ class TraceViewer(App):
         self._set_loading(False)
         self._refresh_stats()
         self.status.ui_children = [
-            "drag: zoom to range · right-click: back · shift/middle-drag: pan · "
-            "wheel: zoom · ctrl+wheel: zoom rows · click: highlight · dbl-click: fit"
+            "drag: zoom to range · right-click: back · "
+            "middle/shift-drag or two-finger swipe: pan · wheel: zoom · "
+            "click: info · double-click: highlight"
         ]
 
     # ---- rendering ----
@@ -467,6 +468,15 @@ class TraceViewer(App):
         x, y = ev["canvasX"], ev["canvasY"]
         self._cancel_hide()
         self._hide_now()
+        # middle button (buttons==4) or shift held → always pan, even if the
+        # mousedown that set the mode was missed; this keeps middle-drag a pure
+        # pan instead of ever falling into the box-zoom select.
+        if ev.get("buttons") == 4 or ev.get("shiftKey"):
+            if self._drag_mode != "pan":
+                self._drag_mode = "pan"
+                self._pan_pushed = False
+                self._hide_selection()
+                self._drag_last = (x, y)
         if self._drag_mode == "pan":
             if not self._pan_pushed:  # one history entry per pan gesture
                 self._push_history()
@@ -492,12 +502,23 @@ class TraceViewer(App):
     def _on_wheel(self, ev):
         if self.view is None:
             return
-        # coalesce a burst of wheel events into one history entry
+        dx = ev.get("deltaX", 0) or 0
+        dy = ev.get("deltaY", 0) or 0
+        # two-finger trackpad swipe (has a horizontal component) or shift+scroll
+        # → pan; a horizontal swipe pans time, a vertical one pans rows.
+        if dx != 0 or ev.get("shiftKey"):
+            if dx != 0:
+                self.view.pan_px(-dx, -dy)  # trackpad: both axes
+            else:
+                self.view.pan_px(-dy, 0)  # shift + vertical wheel → pan time
+            self.view.apply()
+            return
+        # otherwise zoom (mouse wheel / vertical two-finger / pinch)
         now = time.time()
         if now - self._last_wheel_push > 0.4:
             self._push_history()
         self._last_wheel_push = now
-        factor = 2.0 ** (-ev.get("deltaY", 0) / 240.0)
+        factor = 2.0 ** (-dy / 240.0)
         if ev.get("ctrlKey"):
             self.view.zoom_rows(ev["canvasY"], factor)
         else:

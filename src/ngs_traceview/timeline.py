@@ -271,8 +271,9 @@ class TimelineView:
 
     def pan_px(self, dx: float, dy: float):
         w, h = self._canvas_size()
-        self.t0 -= dx / max(w, 1) * self.span
-        self.t1 = self.t0 + self.span
+        span = self.span  # capture before moving t0 (self.span is t1 - t0)
+        self.t0 -= dx / max(w, 1) * span
+        self.t1 = self.t0 + span
         self.y0 -= dy / max(h, 1) * self.rows_visible
         self._clamp()
 
