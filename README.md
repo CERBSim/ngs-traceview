@@ -13,6 +13,13 @@ ngs-traceview                            # open, then use the file picker
 python -m ngs_traceview mytrace.trace    # equivalent (module form)
 ```
 
+### In a Jupyter notebook
+
+```python
+from ngs_traceview import ShowTrace
+ShowTrace("mytrace.trace")               # embeds the full viewer in the cell
+```
+
 ### Controls
 
 | input | action |
