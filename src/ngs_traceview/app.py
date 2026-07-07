@@ -1,0 +1,625 @@
+import math
+import os
+import threading
+
+from ngapp.app import App
+from ngapp.components import (
+    Div,
+    FileUpload,
+    QBtn,
+    QBtnToggle,
+    QLinearProgress,
+    QSpace,
+    QSpinnerGears,
+    QTable,
+    QTooltip,
+    WebgpuComponent,
+)
+
+from . import style
+from .style import AXIS_HEIGHT, LABEL_WIDTH
+
+MAX_TICKS = 11
+NAME_MAX = 90  # truncate long C++ symbols in the table
+
+
+def nice_ticks(t0: float, t1: float, max_ticks: int = MAX_TICKS):
+    """1-2-5 tick positions covering [t0, t1] (times in ms)."""
+    span = max(t1 - t0, 1e-12)
+    raw = span / max_ticks
+    mag = 10.0 ** math.floor(math.log10(raw))
+    for m in (1.0, 2.0, 5.0, 10.0):
+        if m * mag >= raw:
+            step = m * mag
+            break
+    first = math.ceil(t0 / step) * step
+    ticks = []
+    t = first
+    while t <= t1:
+        ticks.append(t)
+        t += step
+    return ticks, step
+
+
+def format_time(t_ms: float, step_ms: float) -> str:
+    """Format an absolute trace time with a unit chosen from the tick step."""
+    if step_ms >= 100.0:
+        factor, unit = 1000.0, "s"
+    elif step_ms >= 0.1:
+        factor, unit = 1.0, "ms"
+    elif step_ms >= 1e-4:
+        factor, unit = 1e-3, "µs"
+    else:
+        factor, unit = 1e-6, "ns"
+    decimals = max(0, -math.floor(math.log10(step_ms / factor) + 1e-9))
+    return f"{t_ms / factor:.{decimals}f} {unit}"
+
+
+def format_duration(d_ms: float) -> str:
+    for factor, unit in ((1000.0, "s"), (1.0, "ms"), (1e-3, "µs")):
+        if d_ms >= factor:
+            return f"{d_ms / factor:.3g} {unit}"
+    return f"{d_ms / 1e-6:.3g} ns"
+
+
+def _hex(color) -> str:
+    r, g, b = (int(round(c * 255)) for c in color[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _swatch(color):
+    return Div(ui_class=str(style.swatch), ui_style=f"background:{_hex(color)};")
+
+
+class TraceViewer(App):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        style.install(self, default_theme="system")
+        self._dark = style.resolved_theme() == "dark"
+
+        self.trace = None
+        self.renderer = None
+        self.view = None
+
+        self._build_ui()
+
+        self._tick_pool = []
+        self._label_pool = []
+        self._drag_last = None
+        self._hover_px = (0, 0)
+        self._shown_pick = None  # interval idx currently in the tooltip
+        self._hide_timer = None
+        self._stats_open = False
+        self._stats_mode = "all"  # "all" | "view"
+        self._stats_timer = None
+        self._loading_path = None
+
+        self.canvas.on_mounted(self._on_canvas_mounted)
+        self.on_mounted(self._apply_quasar_dark)
+
+    # ---- UI construction ----
+
+    def _build_ui(self):
+        self.file_input = FileUpload(
+            id="file_upload",
+            ui_label="Open .trace file",
+            ui_dense=True,
+            ui_outlined=True,
+            ui_accept=".trace",
+            ui_style="width: 240px;",
+        )
+        self.file_input.on_upload_complete(self._on_upload)
+
+        self.btn_fit = QBtn(
+            QTooltip("Zoom to full trace"),
+            ui_icon="fit_screen", ui_flat=True, ui_dense=True, ui_round=True,
+        )
+        self.btn_fit.on_click(self._on_fit)
+        self.btn_clear = QBtn(
+            QTooltip("Clear highlight"),
+            ui_icon="layers_clear", ui_flat=True, ui_dense=True, ui_round=True,
+        )
+        self.btn_clear.on_click(lambda *_: self._set_highlight(None))
+        self.btn_stats = QBtn(
+            QTooltip("Toggle statistics"),
+            ui_icon="bar_chart", ui_flat=True, ui_dense=True, ui_round=True,
+        )
+        self.btn_stats.on_click(self._toggle_stats)
+
+        self.info_label = Div("no trace loaded", ui_class=str(style.info))
+
+        bar = Div(
+            Div(
+                Div("Trace Viewer", ui_class=str(style.brand_name)),
+                Div("Paje / ngcore timeline", ui_class=str(style.brand_sub)),
+                ui_class=str(style.brand),
+            ),
+            Div(ui_class=str(style.sep)),
+            self.file_input,
+            self.btn_fit,
+            self.btn_clear,
+            QSpace(),
+            self.info_label,
+            Div(ui_class=str(style.sep)),
+            self.btn_stats,
+            ui_class=str(style.bar),
+        )
+
+        # timeline: axis strip + (labels | canvas)
+        self._axis = Div(ui_class=str(style.axis))
+        self._labels = Div(ui_class=str(style.labels))
+        self.canvas = WebgpuComponent(width="100%", height="100%", id="timeline_canvas")
+        self.tooltip = self._build_tooltip()
+        canvas_wrap = Div(self.canvas, self.tooltip, ui_class=str(style.canvas_wrap))
+        timeline_col = Div(
+            self._axis,
+            Div(self._labels, canvas_wrap, ui_class=str(style.body)),
+            ui_class=str(style.timeline_col),
+        )
+
+        self.stats_panel = self._build_stats_panel()
+        self.stats_panel.ui_hidden = True
+
+        self.loading = self._build_loading()
+        self.loading.ui_hidden = True
+
+        mid = Div(timeline_col, self.stats_panel, self.loading, ui_class=str(style.mid))
+
+        self.detail = Div(ui_class=str(style.detail))
+        self.detail.ui_hidden = True
+        self.status = Div("open a .trace file to begin", ui_class=str(style.status))
+
+        self.component = Div(bar, mid, self.detail, self.status, ui_class=str(style.page))
+
+    def _build_loading(self):
+        self.loading_title = Div("Loading trace", ui_class=str(style.load_title))
+        self.loading_msg = Div("", ui_class=str(style.load_msg))
+        self.loading_bar = QLinearProgress(
+            ui_value=0.0, ui_indeterminate=False, ui_rounded=True,
+            ui_color="primary", ui_track_color="grey-8" if self._dark else "grey-3",
+            ui_size="6px", ui_class=str(style.load_bar),
+        )
+        card = Div(
+            QSpinnerGears(ui_size="46px", ui_color="primary"),
+            self.loading_title,
+            self.loading_msg,
+            self.loading_bar,
+            ui_class=str(style.load_card),
+        )
+        return Div(card, ui_class=str(style.overlay))
+
+    def _set_loading(self, active, title=None, msg=None, frac=None):
+        self.loading.ui_hidden = not active
+        if not active:
+            return
+        if title is not None:
+            self.loading_title.ui_children = [title]
+        if msg is not None:
+            self.loading_msg.ui_children = [msg]
+        if frac is None:
+            self.loading_bar.ui_indeterminate = True
+        else:
+            self.loading_bar.ui_indeterminate = False
+            self.loading_bar.ui_value = max(0.0, min(1.0, float(frac)))
+
+    def _build_tooltip(self):
+        self._tt_title = Div(ui_class=str(style.tip_title))
+        self._tt_sub = Div(ui_class=str(style.tip_sub))
+        tip = Div(self._tt_title, self._tt_sub, ui_class=str(style.tooltip))
+        tip.ui_style = "display:none;"
+        return tip
+
+    def _build_stats_panel(self):
+        self.stats_mode_toggle = QBtnToggle(
+            ui_model_value="all",
+            ui_options=[
+                {"label": "Whole trace", "value": "all"},
+                {"label": "Current view", "value": "view"},
+            ],
+            ui_dense=True, ui_flat=True, ui_no_caps=True, ui_toggle_color="primary",
+            ui_style="font-size:11px;",
+        )
+        self.stats_mode_toggle.on("update:model-value", self._on_stats_mode)
+
+        columns = [
+            {"name": "name", "label": "Function", "field": "name", "align": "left",
+             "sortable": True, "classes": "tv-fn", "headerClasses": "tv-fn"},
+            {"name": "count", "label": "Calls", "field": "count", "align": "right", "sortable": True},
+            {"name": "total", "label": "Total s", "field": "total", "align": "right", "sortable": True},
+            {"name": "pct", "label": "%", "field": "pct", "align": "right", "sortable": True},
+            {"name": "mean", "label": "Mean ms", "field": "mean", "align": "right", "sortable": True},
+            {"name": "max", "label": "Max ms", "field": "max", "align": "right", "sortable": True},
+        ]
+        self.stats_table = QTable(
+            ui_columns=columns,
+            ui_rows=[],
+            ui_row_key="id",
+            ui_dense=True,
+            ui_flat=True,
+            ui_selection="single",
+            ui_selected=[],
+            ui_virtual_scroll=True,
+            ui_pagination={"rowsPerPage": 0},
+            ui_hide_bottom=True,
+            ui_dark=self._dark,
+            ui_style="height:100%;",
+        )
+        self.stats_table.on("update:selected", self._on_stats_select)
+
+        head = Div(
+            Div("Statistics", ui_class=str(style.stats_title)),
+            QSpace(),
+            self.stats_mode_toggle,
+            ui_class=str(style.stats_head),
+        )
+        return Div(
+            head,
+            Div(self.stats_table, ui_class=str(style.stats_body)),
+            ui_class=str(style.stats),
+        )
+
+    def _apply_quasar_dark(self):
+        def _set(js):
+            try:
+                js.eval(f"window.$q && window.$q.dark && window.$q.dark.set({str(self._dark).lower()})")
+            except Exception:
+                pass
+        try:
+            self.call_js(_set)
+        except Exception:
+            pass
+
+    # ---- loading ----
+
+    def _on_canvas_mounted(self):
+        path = os.environ.get("NGS_TRACEVIEW_FILE")
+        if path and os.path.exists(path) and self.trace is None:
+            self._load_async(path)
+
+    def _on_upload(self):
+        def work():
+            with self.file_input.as_temporary_file as path:
+                self._load(str(path))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _load_async(self, path: str):
+        threading.Thread(target=self._load, args=(path,), daemon=True).start()
+
+    def _on_progress(self, frac, msg):
+        base = os.path.basename(self._loading_path or "")
+        self._set_loading(True, f"Loading {base}", msg, frac)
+
+    def _load(self, path: str):
+        from . import paje
+
+        self._loading_path = path
+        base = os.path.basename(path)
+        self._set_loading(True, f"Loading {base}", "reading file", 0.0)
+        self.status.ui_children = [f"parsing {base} …"]
+        try:
+            trace = paje.parse(path, progress=self._on_progress)
+        except Exception as e:
+            self._set_loading(False)
+            self.status.ui_children = [f"failed to load {base}: {e}"]
+            raise
+        self.trace = trace
+        self.info_label.ui_children = [
+            f"{base}  ·  {trace.n_intervals:,} intervals  ·  "
+            f"{len(trace.rows)} rows  ·  {trace.parse_time:.1f}s"
+        ]
+        self._set_loading(True, f"Loading {base}", "uploading to GPU", None)
+        self.status.ui_children = ["uploading to GPU …"]
+        try:
+            self._draw()
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            self._set_loading(False)
+            self.status.ui_children = ["draw failed — see console"]
+            return
+        self._set_loading(False)
+        self._refresh_stats()
+        self.status.ui_children = [
+            "wheel: zoom time · ctrl+wheel: zoom rows · drag: pan · "
+            "hover: inspect · click: highlight"
+        ]
+
+    # ---- rendering ----
+
+    def _draw(self):
+        from .timeline import TimelineRenderer, TimelineView
+
+        self.renderer = TimelineRenderer(self.trace)
+        self.view = TimelineView(self.renderer)
+        # legacy (Python-driven) render path: the JS engine's built-in 3D
+        # camera would consume drag/wheel, which we need for 2D pan/zoom
+        scene = self.canvas.draw([self.renderer], use_js_engine=False)
+        self.view.attach(scene)
+        self.view.on_change.append(self._update_overlays)
+        self.view.on_change.append(self._on_view_changed)
+
+        # replace the 3D camera gestures with timeline pan/zoom; the camera
+        # would re-register on visibility changes, so disable it for good
+        camera = scene.options.camera
+        camera.unregister_callbacks(scene.input_handler)
+        camera.register_callbacks = lambda *a, **k: None
+        ih = scene.input_handler
+        ih.on_mousedown(self._on_mousedown)
+        ih.on_mouseup(self._on_mouseup)
+        ih.on_drag(self._on_drag)
+        ih.on_wheel(self._on_wheel)
+        ih.on_dblclick(self._on_dblclick)
+        ih.on_mousemove(self._on_hover)
+        ih.on_mouseout(self._on_mouseout)
+        ih.on_click(self._on_click)
+        self.renderer.on_select(self._on_pick)
+        scene.on_click_background(self._on_pick_background)
+        self.canvas.canvas.on_resize(self._on_resize)
+
+        self._build_overlay_pools()
+        self.view.apply()
+
+    def _on_resize(self, *args):
+        if self.view is not None:
+            self.view.apply()
+
+    # ---- interaction ----
+
+    def _on_mousedown(self, ev):
+        self._drag_last = (ev["canvasX"], ev["canvasY"])
+
+    def _on_mouseup(self, ev):
+        self._drag_last = None
+
+    def _on_drag(self, ev):
+        if self.view is None:
+            return
+        x, y = ev["canvasX"], ev["canvasY"]
+        if self._drag_last is not None:
+            self.view.pan_px(x - self._drag_last[0], y - self._drag_last[1])
+            self.view.apply()
+        self._drag_last = (x, y)
+        self._cancel_hide()
+        self._hide_now()
+
+    def _on_wheel(self, ev):
+        if self.view is None:
+            return
+        factor = 2.0 ** (-ev.get("deltaY", 0) / 240.0)
+        if ev.get("ctrlKey"):
+            self.view.zoom_rows(ev["canvasY"], factor)
+        else:
+            self.view.zoom_time(ev["canvasX"], factor)
+        self.view.apply()
+
+    def _on_dblclick(self, ev):
+        self._on_fit()
+
+    def _on_fit(self, *_):
+        if self.view is None:
+            return
+        self.view.fit()
+        self.view.apply()
+
+    def _set_highlight(self, value):
+        if self.view is not None:
+            self.view.set_highlight(value)
+
+    # ---- hover tooltip (GPU picking) ----
+
+    def _on_hover(self, ev):
+        if self.view is None:
+            return
+        self._hover_px = (ev["canvasX"], ev["canvasY"])
+        self.canvas.select(ev["canvasX"], ev["canvasY"])
+
+    def _on_mouseout(self, ev):
+        self._cancel_hide()
+        self._hide_now()
+
+    def _cancel_hide(self):
+        t = self._hide_timer
+        self._hide_timer = None
+        if t is not None:
+            t.cancel()
+
+    def _schedule_hide(self):
+        self._cancel_hide()
+        t = threading.Timer(0.09, self._hide_now)
+        t.daemon = True
+        self._hide_timer = t
+        t.start()
+
+    def _hide_now(self):
+        self._shown_pick = None
+        self.tooltip.ui_style = "display:none;"
+
+    def _on_pick(self, sel_ev):
+        trace = self.trace
+        idx = int(sel_ev.uint32[0])
+        if trace is None or idx >= trace.n_intervals or self.view is None:
+            self._schedule_hide()
+            return
+        self._cancel_hide()
+        # only rebuild content when we move onto a *different* interval — this
+        # is what keeps the tooltip from flickering as the mouse moves within
+        # one block (each move otherwise tore down and rebuilt the DOM)
+        if idx != self._shown_pick:
+            self._shown_pick = idx
+            value = trace.value[idx]
+            name = trace.names[value]
+            start, end = trace.start[idx], trace.end[idx]
+            row_name = trace.rows[trace.row[idx]].name
+            _, step = nice_ticks(self.view.t0, self.view.t1)
+            self._tt_title.ui_children = [name]
+            self._tt_sub.ui_children = [
+                _swatch(trace.colors[value]),
+                Div(
+                    f"{format_duration(end - start)}  ·  {row_name}  ·  "
+                    f"@ {format_time(start, step / 100)}"
+                ),
+            ]
+            self.status.ui_children = [
+                f"{row_name}:  {format_duration(end - start)}  —  {name[:140]}"
+            ]
+        # reposition every move (cheap single-node style update, no rebuild)
+        dpr = self.view.scene.canvas.dpr or 1
+        x, y = self._hover_px[0] / dpr, self._hover_px[1] / dpr
+        self.tooltip.ui_style = f"display:block; left:{x + 14:.0f}px; top:{y + 14:.0f}px;"
+
+    def _on_pick_background(self, sel_ev):
+        self._schedule_hide()
+
+    def _on_click(self, ev):
+        """Click a block: highlight that function and pin its details."""
+        trace = self.trace
+        idx = self._shown_pick
+        if trace is None or idx is None:
+            self._set_highlight(None)
+            self._sync_stats_selection(None)
+            self.detail.ui_hidden = True
+            return
+        value = int(trace.value[idx])
+        self._set_highlight(value)
+        self._sync_stats_selection(value)
+        self._show_detail(value, idx)
+
+    def _show_detail(self, value, idx):
+        trace = self.trace
+        name = trace.names[value]
+        start, end = trace.start[idx], trace.end[idx]
+        mask = trace.value == value
+        count = int(mask.sum())
+        total = float((trace.end - trace.start)[mask].sum())
+        span = max(trace.tmax - trace.tmin, 1e-12)
+        _, step = nice_ticks(self.view.t0, self.view.t1)
+        close = QBtn(ui_icon="close", ui_flat=True, ui_dense=True, ui_round=True, ui_size="sm")
+        close.on_click(self._clear_detail)
+        self.detail.ui_children = [
+            _swatch(trace.colors[value]),
+            Div(name, ui_class=str(style.detail_name)),
+            Div(
+                f"this call {format_duration(end - start)} @ {format_time(start, step / 100)}"
+                f"   ·   {count:,} calls, {format_duration(total)} total "
+                f"({100 * total / span:.1f}% of trace)",
+                ui_class=str(style.detail_meta),
+            ),
+            close,
+        ]
+        self.detail.ui_hidden = False
+
+    def _clear_detail(self, *_):
+        self.detail.ui_hidden = True
+        self._set_highlight(None)
+        self._sync_stats_selection(None)
+
+    # ---- statistics panel ----
+
+    def _toggle_stats(self, *_):
+        self._stats_open = not self._stats_open
+        self.stats_panel.ui_hidden = not self._stats_open
+        if self._stats_open:
+            self._refresh_stats()
+
+    def _on_stats_mode(self, ev):
+        self._stats_mode = ev.value if hasattr(ev, "value") else ev
+        self._refresh_stats()
+
+    def _on_view_changed(self):
+        if self._stats_open and self._stats_mode == "view":
+            self._schedule_stats_refresh()
+
+    def _schedule_stats_refresh(self):
+        t = self._stats_timer
+        if t is not None:
+            t.cancel()
+        t = threading.Timer(0.25, self._refresh_stats)
+        t.daemon = True
+        self._stats_timer = t
+        t.start()
+
+    def _refresh_stats(self):
+        if self.trace is None or not self._stats_open:
+            return
+        from . import stats
+
+        if self._stats_mode == "view" and self.view is not None:
+            data = stats.compute(self.trace, self.view.t0, self.view.t1)
+        else:
+            data = stats.compute(self.trace)
+        rows = []
+        for s in data:
+            name = s.name if len(s.name) <= NAME_MAX else s.name[: NAME_MAX - 1] + "…"
+            rows.append(
+                {
+                    "id": str(s.value),
+                    "value": s.value,
+                    "name": name,
+                    "count": s.count,
+                    "total": round(s.total / 1000.0, 4),
+                    "pct": round(s.percent, 2),
+                    "mean": round(s.mean, 4),
+                    "max": round(s.max, 4),
+                }
+            )
+        self.stats_table.ui_rows = rows
+
+    def _on_stats_select(self, ev):
+        selected = ev.value if hasattr(ev, "value") else ev
+        self.stats_table.ui_selected = selected or []
+        if selected:
+            value = int(selected[0]["value"])
+            self._set_highlight(value)
+        else:
+            self._set_highlight(None)
+
+    def _sync_stats_selection(self, value):
+        """Reflect a timeline highlight in the stats table selection."""
+        if not self._stats_open:
+            return
+        if value is None:
+            self.stats_table.ui_selected = []
+        else:
+            for row in self.stats_table.ui_rows:
+                if row.get("value") == value:
+                    self.stats_table.ui_selected = [row]
+                    return
+            self.stats_table.ui_selected = []
+
+    # ---- overlays (time axis + row labels) ----
+
+    def _build_overlay_pools(self):
+        self._tick_pool = [Div(ui_style="display:none;") for _ in range(MAX_TICKS + 2)]
+        self._axis.ui_children = list(self._tick_pool)
+        self._label_pool = [Div(ui_style="display:none;") for _ in self.trace.rows]
+        self._labels.ui_children = list(self._label_pool)
+
+    def _update_overlays(self):
+        view = self.view
+        if view is None or view.scene is None or view.scene.canvas is None:
+            return
+        # overlay divs are positioned in CSS pixels as fractions of the canvas;
+        # the device-pixel-ratio cancels out for relative positions
+        ticks, step = nice_ticks(view.t0, view.t1)
+        base = str(style.tick)
+        for i, div in enumerate(self._tick_pool):
+            if i < len(ticks):
+                frac = (ticks[i] - view.t0) / view.span
+                div.ui_children = [format_time(ticks[i], step)]
+                div.ui_class = base
+                div.ui_style = f"left:{frac * 100:.4f}%;"
+            else:
+                div.ui_style = "display:none;"
+
+        row_h = 1.0 / view.rows_visible
+        base_lbl = str(style.label_row)
+        for r, div in enumerate(self._label_pool):
+            top = (r - view.y0) * row_h
+            if -row_h < top < 1.0:
+                div.ui_children = [self.trace.rows[r].name]
+                div.ui_class = base_lbl
+                div.ui_style = f"top:{top * 100:.4f}%; height:{row_h * 100:.4f}%;"
+            else:
+                div.ui_style = "display:none;"

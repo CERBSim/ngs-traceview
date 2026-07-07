@@ -1,0 +1,20 @@
+[build-system]
+requires = [ "setuptools>=60", "wheel", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ngs-traceview"
+dynamic = ["version"]
+dependencies = ["platformdirs", "ngapp", "webgpu", "numpy", "ngsolve_gui"]
+
+[project.scripts]
+ngs-traceview = "ngs_traceview.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ngs_traceview = ["shaders/*.wgsl"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ngs_traceview.__version__"}
