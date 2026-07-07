@@ -62,6 +62,9 @@ fn vertex_timeline(in: VertexIn) -> VertexOut {
   var out: VertexOut;
   out.pos = vec4f(x, y, z, 1.0);
   out.color = in.color;
+  if(in.vi % 2 == 1u) {
+    out.color = vec4f(0.55 * in.color.xyz, in.color.w);
+  }
   out.instance = in.ii;
   out.uv = corner;
   out.size_px = vec2f(w * u_view.canvas_w * 0.5, hn * u_view.canvas_h * 0.5);
