@@ -309,6 +309,15 @@ def parse(path: str, progress=None) -> TraceData:
 
     t_events, cont_col, val_col, meta_lines = _read_events(path, progress)
 
+    # The push/pop pairing below assumes events are in chronological order, but
+    # some traces interleave events out of time order (e.g. multiple worker
+    # threads flushing buffers). Stable-sort by time so the cumsum depth reflects
+    # real nesting; a stable sort keeps file order among equal-timestamp events
+    # (so a pop preceding a same-time push stays before it).
+    if len(t_events) and not np.all(np.diff(t_events) >= 0):
+        order = np.argsort(t_events, kind="stable")
+        t_events, cont_col, val_col = t_events[order], cont_col[order], val_col[order]
+
     if progress:
         progress(0.82, "building intervals")
 
@@ -404,7 +413,8 @@ def parse(path: str, progress=None) -> TraceData:
             starts_l.append(t_sel[push_i])
             ends_l.append(pop_t)
             rows_l.append(np.full(n_pairs, r, dtype=np.uint32))
-            depths_l.append(np.full(n_pairs, level - 1, dtype=np.uint8))
+            # depth is packed into 8 bits of the shader flags, so clamp at 255
+            depths_l.append(np.full(n_pairs, min(level - 1, 255), dtype=np.uint8))
             values_l.append(v_sel[push_i])
             rows[r].max_depth = max(rows[r].max_depth, level)
 
