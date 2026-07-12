@@ -9,7 +9,9 @@ computing the nesting depth with a cumulative sum they pair up elementwise.
 Times in the file are in milliseconds (ngcore ConvertTime).
 """
 
+import colorsys
 import dataclasses
+import hashlib
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +48,17 @@ def _unquote(s: bytes) -> str:
     if len(s) >= 2 and s[:1] == b'"' and s[-1:] == b'"':
         s = s[1:-1]
     return s.decode("utf-8", errors="replace")
+
+
+def _auto_color(name: str) -> tuple[float, float, float]:
+    """Deterministic, well-spread color for values that carry no defined color.
+
+    Hues come from a stable hash of the name (hashlib, not the salted built-in
+    hash) so a given state gets the same color across runs and sessions.
+    """
+    h = int.from_bytes(hashlib.md5(name.encode("utf-8")).digest()[:4], "big")
+    hue = (h % 1000) / 1000.0
+    return colorsys.hsv_to_rgb(hue, 0.55, 0.9)
 
 
 @dataclasses.dataclass
@@ -346,10 +359,12 @@ def parse(path: str, progress=None) -> TraceData:
             continue  # pop marker, never used as a value
         if alias in entity_names:
             name = entity_names[alias]
-            col = entity_colors.get(alias, (0.5, 0.5, 0.5))
+            col = entity_colors.get(alias) or _auto_color(name)
         else:
+            # inline (quoted) value with no DEFINE_ENTITY_VALUE — most GPU/state
+            # events arrive this way; give each distinct name its own color
             name = _unquote(alias)
-            col = (0.5, 0.5, 0.5)
+            col = _auto_color(name)
         val_map[i] = len(names)
         names.append(name)
         colors.append((*col[:3], 1.0))
