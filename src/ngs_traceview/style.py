@@ -200,3 +200,77 @@ css.add_rule(".tv-stats-body .q-table td:first-child, .tv-stats-body .q-table th
              Style(padding_left="6px", padding_right="4px"))
 css.add_rule(".tv-stats-body .q-table td, .tv-stats-body .q-table th",
              Style(padding_left="6px", padding_right="6px"))
+
+# ── memory rows: markers on the canvas ───────────────────────────────────────
+hover_line = _cls(
+    "tv-hover-line", position="absolute", top="0", bottom="0", width="0",
+    z_index="35", pointer_events="none", border_left="1px solid var(--fg-faint)",
+)
+mem_mark = _cls(
+    "tv-mem-mark", position="absolute", top="0", bottom="0", z_index="38",
+    pointer_events="none",
+    background="color-mix(in srgb, var(--accent) 14%, transparent)",
+    border_left="1px solid var(--accent)", border_right="1px solid var(--accent)",
+)
+
+# ── memory panel (shares the side pane with the statistics) ──────────────────
+mem_body = _cls(
+    "tv-mem-body", display="flex", flex_direction="column", gap="10px", flex="1",
+    min_height="0", overflow="auto", padding="10px 12px 14px",
+)
+mem_mode = _cls("tv-mem-mode", font_size="12.5px", color="var(--fg-muted)",
+                font_family="var(--font-mono)", white_space="nowrap",
+                overflow="hidden", text_overflow="ellipsis")
+mem_tiles = _cls("tv-mem-tiles", display="flex", gap="18px", align_items="flex-end")
+mem_tile_label = _cls("tv-mem-tile-label", font_size="11px", letter_spacing="0.06em",
+                      text_transform="uppercase", color="var(--fg-subtle)")
+mem_hero = _cls("tv-mem-hero", font_size="30px", font_weight="600", line_height="1.1",
+                color="var(--fg)")
+mem_value = _cls("tv-mem-value", font_size="16px", font_weight="600", color="var(--fg)")
+mem_nav = _cls("tv-mem-nav", display="flex", align_items="center", gap="4px",
+               min_height="30px")
+mem_crumb = _cls("tv-mem-crumb", font_family="var(--font-mono)", font_size="12px",
+                 color="var(--fg-muted)", flex="1", min_width="0", white_space="nowrap",
+                 overflow="hidden", text_overflow="ellipsis")
+mem_sun_wrap = _cls(
+    "tv-sun-wrap", position="relative", width="100%", max_width="440px",
+    aspect_ratio="1 / 1", align_self="center", flex="none",
+)
+mem_sun = _cls("tv-sun", width="100%", height="100%", display="block")
+css.add_rule(".tv-sun path, .tv-sun circle", Style(cursor="pointer"))
+css.add_rule(".tv-sun path:hover, .tv-sun circle:hover", Style(filter="brightness(1.12)"))
+# arcs that cannot be zoomed into: own bytes of a timer, folded "other" stacks
+mem_sun_static = _cls("tv-sun-static")
+css.add_rule(".tv-sun path.tv-sun-static", Style(cursor="default"))
+css.add_rule(".tv-sun path.tv-sun-static:hover", Style(filter="none"))
+mem_center = _cls(
+    "tv-sun-center", position="absolute", left="50%", top="50%",
+    transform="translate(-50%, -50%)", width="22%", text_align="center",
+    pointer_events="none", font_size="12px", color="var(--fg-muted)",
+    overflow="hidden", text_overflow="ellipsis", white_space="nowrap",
+)
+mem_list = _cls("tv-mem-list", display="flex", flex_direction="column", gap="1px",
+                font_size="12.5px")
+mem_list_head = _cls("tv-mem-list-head", font_size="11px", letter_spacing="0.06em",
+                     text_transform="uppercase", color="var(--fg-subtle)",
+                     margin_top="4px")
+mem_list_row = _cls(
+    "tv-mem-list-row", display="flex", align_items="center", gap="8px",
+    padding="3px 6px", border_radius="var(--r-xs)", cursor="pointer",
+)
+mem_list_row.rule(":hover", background="var(--panel-header)")
+mem_list_name = _cls("tv-mem-list-name", flex="1", min_width="0", white_space="nowrap",
+                     overflow="hidden", text_overflow="ellipsis",
+                     font_family="var(--font-mono)", font_size="12px", color="var(--fg)")
+mem_list_val = _cls("tv-mem-list-val", font_family="var(--font-mono)", font_size="12px",
+                    color="var(--fg-muted)", white_space="nowrap",
+                    font_variant_numeric="tabular-nums")
+# cursor tooltip for sunburst segments; created by JS and appended to <body>
+css.add_rule(
+    ".tv-suntip",
+    Style(position="fixed", z_index="200", pointer_events="none", max_width="520px",
+          padding="8px 11px", white_space="pre-line", overflow_wrap="anywhere",
+          background="var(--surface)", color="var(--fg)", font_size="13px",
+          font_family="var(--font-mono)", border="1px solid var(--border-strong)",
+          border_radius="var(--r-md)", box_shadow="var(--shadow-pop)"),
+)

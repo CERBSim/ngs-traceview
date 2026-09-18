@@ -4,8 +4,10 @@ import re
 import threading
 import time
 
+import numpy as np
 from ngapp.app import App
 from ngapp.components import (
+    Component,
     Div,
     FileUpload,
     QBtn,
@@ -21,11 +23,14 @@ from ngapp.components import (
     WebgpuComponent,
 )
 
-from . import style
+from . import memory, style
+from .memory import format_bytes
 from .style import AXIS_HEIGHT, LABEL_WIDTH
 
 MAX_TICKS = 11
 NAME_MAX = 90  # truncate long C++ symbols in the table
+SUN_RINGS = 5  # rings drawn below the focused stack
+SUN_LIST = 12  # children listed under the sunburst
 
 
 def nice_ticks(t0: float, t1: float, max_ticks: int = MAX_TICKS):
@@ -76,6 +81,31 @@ def _swatch(color):
     return Div(ui_class=str(style.swatch), ui_style=f"background:{_hex(color)};")
 
 
+def _short(name: str, n: int = NAME_MAX) -> str:
+    return name if len(name) <= n else name[: n - 1] + "…"
+
+
+def _svg(tag: str, *children, **attrs):
+    """SVG element as an ngapp component (attribute names as in SVG)."""
+    c = Component(tag, *children)
+    for k, v in attrs.items():
+        c._props[k] = v
+    return c
+
+
+def _arc_path(cx, cy, r0, r1, a0, a1):
+    """Ring sector between radii r0 < r1 and angles a0 < a1 (radians, clockwise
+    from 12 o'clock)."""
+    a1 = min(a1, a0 + 2 * math.pi - 1e-3)
+    large = 1 if a1 - a0 > math.pi else 0
+    x = lambda r, a: cx + r * math.sin(a)
+    y = lambda r, a: cy - r * math.cos(a)
+    return (
+        f"M{x(r1, a0):.2f} {y(r1, a0):.2f} A{r1} {r1} 0 {large} 1 {x(r1, a1):.2f} {y(r1, a1):.2f} "
+        f"L{x(r0, a1):.2f} {y(r0, a1):.2f} A{r0} {r0} 0 {large} 0 {x(r0, a0):.2f} {y(r0, a0):.2f} Z"
+    )
+
+
 class TraceViewer(App):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -106,6 +136,16 @@ class TraceViewer(App):
         self._stats_mode = "all"  # "all" | "view"
         self._stats_timer = None
         self._loading_path = None
+        self._side_mode = "stats"  # which panel fills the side pane: "stats" | "memory"
+        self._hover_line_on = False
+        self._mem_renderer = None
+        self._mem_kind = None  # "host" | "device" while the memory panel is open
+        self._mem_time = None  # click time (alive-at view)
+        self._mem_range = None  # (t0, t1) for the growth view
+        self._mem_focus = 0
+        self._mem_hist = []  # focus history for "back"
+        self._mem_incl = None
+        self._mem_drag_kind = None
 
         self.canvas.on_mounted(self._on_canvas_mounted)
         self.on_mounted(self._apply_quasar_dark)
@@ -265,8 +305,11 @@ class TraceViewer(App):
         self.tooltip = self._build_tooltip()
         self.sel_box = Div(ui_class=str(style.sel_box))
         self.sel_box.ui_style = "display:none;"
+        self.hover_line = Div(ui_class=str(style.hover_line), ui_style="display:none;")
+        self.mem_mark = Div(ui_class=str(style.mem_mark), ui_style="display:none;")
         canvas_wrap = Div(
-            self.canvas, self.sel_box, self.tooltip, ui_class=str(style.canvas_wrap)
+            self.canvas, self.sel_box, self.mem_mark, self.hover_line, self.tooltip,
+            ui_class=str(style.canvas_wrap),
         )
         timeline_col = Div(
             self._axis,
@@ -275,6 +318,10 @@ class TraceViewer(App):
         )
 
         self.stats_panel = self._build_stats_panel()
+        self.mem_panel = self._build_mem_panel()
+        self.mem_panel.ui_hidden = True
+        side = Div(self.stats_panel, self.mem_panel,
+                   ui_style="display:flex; width:100%; height:100%; min-height:0;")
 
         self.loading = self._build_loading()
         self.loading.ui_hidden = True
@@ -287,7 +334,7 @@ class TraceViewer(App):
             ui_reverse=True,
             ui_limits=[0, 1000],
             ui_emit_immediately=True,
-            ui_slots={"before": [timeline_col], "after": [self.stats_panel]},
+            ui_slots={"before": [timeline_col], "after": [side]},
             ui_style="height:100%; width:100%;",
         )
         self.splitter.on("update:model-value", self._on_splitter)
@@ -387,6 +434,90 @@ class TraceViewer(App):
             ui_class=str(style.stats),
         )
 
+    def _build_mem_panel(self):
+        self.mem_title = Div("Memory", ui_class=str(style.stats_title))
+        btn_peak = QBtn(
+            QTooltip("Move the click time to the maximum of this row"),
+            ui_label="go to peak", ui_icon="vertical_align_top", ui_flat=True,
+            ui_dense=True, ui_no_caps=True, ui_size="sm",
+        )
+        btn_peak.on_click(self._mem_go_to_peak)
+        btn_close = QBtn(
+            QTooltip("Close (back to statistics)"),
+            ui_icon="close", ui_flat=True, ui_dense=True, ui_round=True, ui_size="sm",
+        )
+        btn_close.on_click(lambda *_: self._close_memory())
+        head = Div(self.mem_title, QSpace(), btn_peak, btn_close,
+                   ui_class=str(style.stats_head))
+
+        self.mem_mode = Div(ui_class=str(style.mem_mode))
+        self.mem_hero_label = Div(ui_class=str(style.mem_tile_label))
+        self.mem_hero = Div(ui_class=str(style.mem_hero))
+        self.mem_peak_label = Div("peak", ui_class=str(style.mem_tile_label))
+        self.mem_peak = Div(ui_class=str(style.mem_value))
+        tiles = Div(
+            Div(self.mem_hero_label, self.mem_hero),
+            Div(self.mem_peak_label, self.mem_peak),
+            ui_class=str(style.mem_tiles),
+        )
+        btn_back = QBtn(QTooltip("One level up"), ui_icon="arrow_back", ui_flat=True,
+                        ui_dense=True, ui_round=True, ui_size="sm")
+        btn_back.on_click(lambda *_: self._mem_back())
+        btn_root = QBtn(QTooltip("Back to the whole stack tree"), ui_icon="home",
+                        ui_flat=True, ui_dense=True, ui_round=True, ui_size="sm")
+        btn_root.on_click(lambda *_: self._mem_zoom(0, push=True))
+        self.mem_crumb = Div(ui_class=str(style.mem_crumb))
+        nav = Div(btn_back, btn_root, self.mem_crumb, ui_class=str(style.mem_nav))
+
+        self.mem_svg = _svg("svg", viewBox="0 0 400 400")
+        self.mem_svg.ui_class = str(style.mem_sun)
+        self.mem_center = Div(ui_class=str(style.mem_center))
+        sun = Div(self.mem_svg, self.mem_center, ui_class=str(style.mem_sun_wrap))
+        self.mem_list_head = Div(ui_class=str(style.mem_list_head))
+        self.mem_list = Div(ui_class=str(style.mem_list))
+
+        body = Div(self.mem_mode, tiles, nav, sun, self.mem_list_head, self.mem_list,
+                   ui_class=str(style.mem_body))
+        panel = Div(head, body, ui_class=str(style.stats))
+        panel.on_mounted(self._install_sun_tip)
+        return panel
+
+    _SUN_TIP_JS = r"""(function(){
+      if (window.__tvSunTip) return;
+      window.__tvSunTip = true;
+      var tip = document.createElement('div');
+      tip.className = 'tv-suntip';
+      tip.style.display = 'none';
+      document.body.appendChild(tip);
+      // a click rerenders the sunburst: the hovered segment is gone
+      document.addEventListener('mousedown', function(){ tip.style.display = 'none'; }, true);
+      document.addEventListener('mousemove', function(e){
+        var el = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+        if (!el) { tip.style.display = 'none'; return; }
+        tip.textContent = el.getAttribute('data-tip');
+        tip.style.display = 'block';
+        var w = window.innerWidth, h = window.innerHeight;
+        tip.style.left = (e.clientX > w * 0.6 ? '' : (e.clientX + 14) + 'px');
+        tip.style.right = (e.clientX > w * 0.6 ? (w - e.clientX + 14) + 'px' : '');
+        tip.style.top = (e.clientY > h * 0.65 ? '' : (e.clientY + 14) + 'px');
+        tip.style.bottom = (e.clientY > h * 0.65 ? (h - e.clientY + 14) + 'px' : '');
+      });
+    })();"""
+
+    def _install_sun_tip(self):
+        # cursor-following tooltip for the sunburst segments, entirely in the
+        # browser (native events reach Python without cursor coordinates)
+        def _run(js):
+            try:
+                js.eval(self._SUN_TIP_JS)
+            except Exception:
+                pass
+
+        try:
+            self.call_js(_run)
+        except Exception:
+            pass
+
     def _apply_quasar_dark(self):
         def _set(js):
             try:
@@ -433,9 +564,12 @@ class TraceViewer(App):
             self.status.ui_children = [f"failed to load {base}: {e}"]
             raise
         self.trace = trace
+        mem_info = (
+            f"  ·  {trace.memory.n_events:,} memory events" if trace.memory else ""
+        )
         self.info_label.ui_children = [
             f"{base}  ·  {trace.n_intervals:,} intervals  ·  "
-            f"{len(trace.rows)} rows  ·  {trace.parse_time:.1f}s"
+            f"{len(trace.rows)} rows{mem_info}  ·  {trace.parse_time:.1f}s"
         ]
         self._set_loading(True, f"Loading {base}", "uploading to GPU", None)
         self.status.ui_children = ["uploading to GPU …"]
@@ -459,13 +593,19 @@ class TraceViewer(App):
     # ---- rendering ----
 
     def _draw(self):
-        from .timeline import TimelineRenderer, TimelineView
+        from .timeline import MemoryRenderer, TimelineRenderer, TimelineView
 
+        self._close_memory(refresh=False)
         self.renderer = TimelineRenderer(self.trace)
-        self.view = TimelineView(self.renderer)
+        renderers = [self.renderer]
+        self._mem_renderer = None
+        if self.trace.memory is not None:
+            self._mem_renderer = MemoryRenderer(self.trace, dark=self._dark)
+            renderers.append(self._mem_renderer)
+        self.view = TimelineView(self.renderer, aux=[r for r in renderers[1:]])
         # legacy (Python-driven) render path: the JS engine's built-in 3D
         # camera would consume drag/wheel, which we need for 2D pan/zoom
-        scene = self.canvas.draw([self.renderer], use_js_engine=False)
+        scene = self.canvas.draw(renderers, use_js_engine=False)
         self.view.attach(scene)
         self.view.on_change.append(self._update_overlays)
         self.view.on_change.append(self._on_view_changed)
@@ -527,24 +667,27 @@ class TraceViewer(App):
             return
         x, y = ev["canvasX"], ev["canvasY"]
         self._drag_last = (x, y)
-        # plain left-drag = rubber-band time zoom (ViTE); shift or middle = pan
+        # plain left-drag = rubber-band time zoom (ViTE); shift or middle = pan;
+        # on a memory row a left-drag selects the range for the growth sunburst
         pan = ev.get("shiftKey") or button == 1 or ev.get("buttons") == 4
         self._drag_mode = "pan" if pan else "select"
+        self._mem_drag_kind = None if pan else self._memory_kind_at(y)
+        if self._mem_drag_kind is not None:
+            self._drag_mode = "memsel"
         self._sel_start = x
         self._sel_moved = False
         self._pan_pushed = False
 
     def _on_mouseup(self, ev):
-        if (
-            self.view is not None
-            and self._drag_mode == "select"
-            and self._sel_moved
-        ):
-            self._push_history()
+        if self.view is not None and self._sel_moved:
             a = self.view.time_at(min(self._sel_start, ev["canvasX"]))
             b = self.view.time_at(max(self._sel_start, ev["canvasX"]))
-            self.view.set_time_range(a, b)
-            self.view.apply()
+            if self._drag_mode == "select":
+                self._push_history()
+                self.view.set_time_range(a, b)
+                self.view.apply()
+            elif self._drag_mode == "memsel":
+                self._open_memory(self._mem_drag_kind, t0=a, t1=b)
         self._hide_selection()
         self._drag_last = None
         self._drag_mode = None
@@ -572,7 +715,7 @@ class TraceViewer(App):
                 self.view.pan_px(x - self._drag_last[0], y - self._drag_last[1])
                 self.view.apply()
             self._drag_last = (x, y)
-        elif self._drag_mode == "select":
+        elif self._drag_mode in ("select", "memsel"):
             if abs(x - self._sel_start) > 3:
                 self._sel_moved = True
             self._show_selection(self._sel_start, x)
@@ -678,14 +821,248 @@ class TraceViewer(App):
         # during a drag (button held) skip GPU picking — the "mousemove" event
         # fires alongside "drag", and a select round-trip per move would clog
         # the link and starve the drag/mouseup events
-        if self._drag_mode in ("pan", "select", "back") or ev.get("buttons"):
+        if self._drag_mode in ("pan", "select", "memsel", "back") or ev.get("buttons"):
             return
         self._hover_px = (ev["canvasX"], ev["canvasY"])
+        kind = self._memory_kind_at(ev["canvasY"])
+        if kind is not None:
+            self._hover_memory(kind, ev["canvasX"])
+            return
+        self._set_hover_line(None)
         self.canvas.select(ev["canvasX"], ev["canvasY"])
 
     def _on_mouseout(self, ev):
         self._cancel_hide()
         self._hide_now()
+        self._set_hover_line(None)
+
+    # ---- memory rows ----
+
+    def _memory_kind_at(self, py) -> str | None:
+        """'host' / 'device' if the canvas pixel row is a memory row."""
+        if self.view is None or self.trace is None or self.trace.memory is None:
+            return None
+        row = self.view.row_at(py)
+        return None if row is None else self.trace.memory.kind_of_row(row)
+
+    def _set_hover_line(self, x_dev):
+        if x_dev is None:
+            if self._hover_line_on:
+                self._hover_line_on = False
+                self.hover_line.ui_style = "display:none;"
+            return
+        dpr = (self.view.scene.canvas.dpr if self.view.scene else 1) or 1
+        self._hover_line_on = True
+        self.hover_line.ui_style = f"display:block; left:{x_dev / dpr:.0f}px;"
+
+    def _hover_memory(self, kind, x_dev):
+        self._cancel_hide()
+        self._shown_pick = None
+        k = self.trace.memory.kind(kind)
+        t = self.view.time_at(x_dev)
+        value = k.value_at(t)
+        _, step = nice_ticks(self.view.t0, self.view.t1)
+        self._tt_title.ui_children = [format_bytes(value)]
+        self._tt_sub.ui_children = [
+            Div(f"memory {kind}  ·  @ {format_time(t, step / 100)}  ·  {value:,.0f} B")
+        ]
+        self.status.ui_children = [
+            f"memory {kind}:  {format_bytes(value)} @ {format_time(t, step / 100)}  ·  "
+            "click: sunburst of memory alive here · drag: growth in a range"
+        ]
+        self._set_hover_line(x_dev)
+        self._place_tooltip()
+
+    def _open_memory(self, kind, t=None, t0=None, t1=None):
+        self._mem_kind = kind
+        self._mem_time = t
+        self._mem_range = None if t0 is None else (min(t0, t1), max(t0, t1))
+        self._mem_focus = 0
+        self._mem_hist = []
+        self._show_side("memory")
+        self._render_memory()
+        self._update_overlays()
+
+    def _close_memory(self, refresh=True):
+        self._mem_kind = None
+        self._mem_incl = None
+        self.mem_mark.ui_style = "display:none;"
+        if refresh:
+            self._show_side("stats")
+
+    def _mem_go_to_peak(self, *_):
+        if self._mem_kind is None:
+            return
+        k = self.trace.memory.kind(self._mem_kind)
+        t_peak, _ = k.peak()
+        self._mem_time, self._mem_range = t_peak, None
+        self._mem_focus, self._mem_hist = 0, []
+        v = self.view
+        if not (v.t0 <= t_peak <= v.t1):  # bring the peak into view
+            self._push_history()
+            v.set_time_range(t_peak - v.span / 2, t_peak + v.span / 2)
+            v.apply()
+        self._render_memory()
+        self._update_overlays()
+
+    def _mem_zoom(self, sid, push=True):
+        if self._mem_kind is None or sid == self._mem_focus:
+            return
+        if push:
+            self._mem_hist.append(self._mem_focus)
+        self._mem_focus = int(sid)
+        self._render_memory(recompute=False)
+
+    def _mem_back(self):
+        if self._mem_hist:
+            self._mem_focus = self._mem_hist.pop()
+        elif self._mem_focus:
+            self._mem_focus = int(self.trace.memory.stack_parent[self._mem_focus])
+        else:
+            return
+        self._render_memory(recompute=False)
+
+    def _stack_name(self, sid):
+        m = self.trace.memory
+        return "all memory" if sid == 0 else self.trace.names[m.stack_value[sid]]
+
+    def _own_label(self, sid):
+        return "outside any timer" if sid == 0 else f"in {_short(self._stack_name(sid), 60)} itself"
+
+    def _stack_color(self, sid):
+        m = self.trace.memory
+        return self.trace.colors[m.stack_value[sid]] if sid else (0.55, 0.55, 0.55)
+
+    def _render_memory(self, recompute=True):
+        trace = self.trace
+        if trace is None or trace.memory is None or self._mem_kind is None:
+            return
+        m = trace.memory
+        k = m.kind(self._mem_kind)
+        _, step = nice_ticks(self.view.t0, self.view.t1)
+        fmt = lambda t: format_time(t, step / 100)
+        if recompute:
+            if self._mem_range is None:
+                mask = memory.alive_mask(k, self._mem_time)
+            else:
+                mask = memory.growth_mask(k, *self._mem_range)
+            self._mem_incl = memory.inclusive_bytes(m, memory.self_bytes(m, k, mask))
+        incl = self._mem_incl
+        total = float(incl[0])
+
+        self.mem_title.ui_children = [f"Memory {self._mem_kind}"]
+        t_peak, v_peak = k.peak()
+        self.mem_peak.ui_children = [f"{format_bytes(v_peak)} @ {fmt(t_peak)}"]
+        if self._mem_range is None:
+            t = self._mem_time
+            self.mem_mode.ui_children = [f"memory alive at {fmt(t)}"]
+            self.mem_hero_label.ui_children = ["allocated at click time, relative to trace start"]
+            self.mem_hero.ui_children = [format_bytes(k.value_at(t))]
+        else:
+            t0, t1 = self._mem_range
+            self.mem_mode.ui_children = [f"memory growth in [{fmt(t0)}, {fmt(t1)}]"]
+            self.mem_hero_label.ui_children = [
+                "allocated inside the range and still alive at its end"
+            ]
+            self.mem_hero.ui_children = [format_bytes(total)]
+
+        focus = self._mem_focus
+        path = m.path(focus)
+        crumb = " › ".join(_short(self._stack_name(s), 40) for s in path) or "all stacks"
+        self.mem_crumb.ui_children = [crumb]
+        self.mem_crumb._props["title"] = " › ".join(self._stack_name(s) for s in path)
+
+        self.mem_svg.ui_children = self._sunburst_children(m, incl, focus, total)
+        f_val = float(incl[focus])
+        self.mem_center.ui_children = [
+            Div(format_bytes(f_val), ui_style="font-weight:600; color:var(--fg);"),
+            Div(f"{100 * f_val / total:.1f}%" if total > 0 else "–"),
+        ]
+        self._render_mem_list(m, incl, focus, total)
+
+    def _sunburst_children(self, m, incl, focus, total):
+        cx = cy = 200.0
+        r_in, r_out = 46.0, 196.0
+        ring_w = (r_out - r_in) / SUN_RINGS
+        ref = float(incl[focus])
+        items = []
+        f_col = _hex(self._stack_color(focus)) if focus else "var(--border-strong)"
+        centre = _svg(
+            "circle", cx=cx, cy=cy, r=r_in - 3,
+            style=f"fill:{f_col}; fill-opacity:{0.35 if focus else 0.5}; stroke:var(--panel); stroke-width:2;",
+        )
+        centre._props["data-tip"] = (
+            f"{self._stack_name(focus)}\n{format_bytes(ref)}"
+            + (" · click: one level up" if focus else "")
+        )
+        centre.on("click", lambda ev: self._mem_back())
+        items.append(centre)
+        if ref <= 0:
+            return items
+        for a in memory.sunburst(m, incl, focus, rings=SUN_RINGS):
+            r0 = r_in + (a.level - 1) * ring_w
+            d = _arc_path(cx, cy, r0, r0 + ring_w, a.a0, a.a1)
+            share = f"{format_bytes(a.value)} · {100 * a.value / ref:.1f}%"
+            fill, opacity = _hex(self._stack_color(a.sid)), 1.0
+            if a.own:
+                label = self._own_label(a.sid)
+                fill, opacity = ("var(--fg-subtle)", 0.3) if a.sid == 0 else (fill, 0.3)
+                tip = f"{label}\n{share}"
+            elif a.other:
+                fill = "var(--border-strong)"
+                tip = f"{a.other} smaller stacks\n{share}"
+            else:
+                tip = f"{self._stack_name(a.sid)}\n{share}\nclick: zoom in"
+            p = _svg("path", d=d, style=(
+                f"fill:{fill}; fill-opacity:{opacity}; stroke:var(--panel); stroke-width:2;"
+            ))
+            p._props["data-tip"] = tip
+            if a.own or a.other:
+                p.ui_class = str(style.mem_sun_static)
+            else:
+                p.on("click", lambda ev, sid=a.sid: self._mem_zoom(sid))
+            items.append(p)
+        return items
+
+    def _render_mem_list(self, m, incl, focus, total):
+        order, start = memory.children_lists(m)
+        kids = order[start[focus] : start[focus + 1]]
+        kids = kids[incl[kids] > 0]
+        kids = kids[np.argsort(-incl[kids], kind="stable")]
+        ref = float(incl[focus])
+        rows = []
+        own = ref - float(incl[kids].sum())
+        if own > 0.5 and ref > 0:
+            label = self._own_label(focus)
+            rows.append(Div(
+                _swatch((0.55, 0.55, 0.55)),
+                Div(label, ui_class=str(style.mem_list_name), ui_style="color:var(--fg-muted);"),
+                Div(f"{format_bytes(own)} · {100 * own / ref:.1f}%", ui_class=str(style.mem_list_val)),
+                ui_class=str(style.mem_list_row), ui_style="cursor:default;",
+            ))
+        for sid in kids[:SUN_LIST]:
+            v = float(incl[sid])
+            name = self._stack_name(int(sid))
+            row = Div(
+                _swatch(self._stack_color(int(sid))),
+                Div(name, ui_class=str(style.mem_list_name)),
+                Div(f"{format_bytes(v)} · {100 * v / ref:.1f}%", ui_class=str(style.mem_list_val)),
+                ui_class=str(style.mem_list_row),
+            )
+            row._props["title"] = name
+            row.on("click", lambda ev, sid=int(sid): self._mem_zoom(sid))
+            rows.append(row)
+        rest = len(kids) - SUN_LIST
+        if rest > 0:
+            rows.append(Div(f"… {rest} more stacks", ui_class=str(style.mem_list_val),
+                            ui_style="padding:3px 6px;"))
+        if ref <= 0:
+            rows = [Div("no allocations", ui_class=str(style.mem_list_val),
+                        ui_style="padding:3px 6px;")]
+        self.mem_list_head.ui_children = [
+            f"stacks below {'root' if focus == 0 else 'focus'}  ·  {len(kids)}"
+        ]
+        self.mem_list.ui_children = rows
 
     def _cancel_hide(self):
         t = self._hide_timer
@@ -732,6 +1109,9 @@ class TraceViewer(App):
             self.status.ui_children = [
                 f"{row_name}:  {format_duration(end - start)}  —  {name[:140]}"
             ]
+        self._place_tooltip()
+
+    def _place_tooltip(self):
         # reposition every move (cheap single-node style update, no rebuild).
         # Flip above / left of the cursor near the bottom / right edges so the
         # tooltip is never clipped by the canvas area (e.g. on the last rows).
@@ -759,6 +1139,10 @@ class TraceViewer(App):
         """Left-click a block: show its info. If a double-click highlight is
         active, clicking again removes it (toggle off)."""
         if ev.get("button", 0) != 0:  # right-click is handled as "go back"
+            return
+        kind = self._memory_kind_at(ev.get("canvasY", -1))
+        if kind is not None:
+            self._open_memory(kind, t=self.view.time_at(ev["canvasX"]))
             return
         if self._click_highlight is not None:
             self._click_highlight = None
@@ -820,11 +1204,25 @@ class TraceViewer(App):
     # ---- statistics panel ----
 
     def _toggle_stats(self, *_):
-        # drive the splitter: 0 = closed, remembered width = open
+        # drive the splitter: 0 = closed, remembered width = open; from the
+        # memory panel the key switches back to the statistics instead
+        if self._stats_open and self._side_mode == "memory":
+            self._close_memory()
+            return
         opening = not self._stats_open
         self.splitter.ui_model_value = self._stats_width if opening else 0
         self._stats_open = opening
         if opening:
+            self._refresh_stats()
+
+    def _show_side(self, mode):
+        self._side_mode = mode
+        self.stats_panel.ui_hidden = mode != "stats"
+        self.mem_panel.ui_hidden = mode != "memory"
+        if not self._stats_open:
+            self.splitter.ui_model_value = self._stats_width
+            self._stats_open = True
+        if mode == "stats":
             self._refresh_stats()
 
     def _on_splitter(self, ev):
@@ -858,7 +1256,7 @@ class TraceViewer(App):
         t.start()
 
     def _refresh_stats(self):
-        if self.trace is None or not self._stats_open:
+        if self.trace is None or not self._stats_open or self._side_mode != "stats":
             return
         from . import stats
 
@@ -906,6 +1304,32 @@ class TraceViewer(App):
 
     # ---- overlays (time axis + row labels) ----
 
+    def _row_label(self, r):
+        row = self.trace.rows[r]
+        if row.kind == "memory" and self.trace.memory is not None:
+            k = self.trace.memory.kind_of_row(r)
+            _, v_peak = self.trace.memory.kind(k).peak()
+            return f"{row.name}  ▲ {format_bytes(v_peak)}"
+        return row.name
+
+    def _update_mem_mark(self):
+        view = self.view
+        if self._mem_kind is None or view is None:
+            self.mem_mark.ui_style = "display:none;"
+            return
+        if self._mem_range is None:
+            f = (self._mem_time - view.t0) / view.span
+            self.mem_mark.ui_style = (
+                f"display:block; left:{f * 100:.4f}%; width:0; border-right:none;"
+            )
+        else:
+            t0, t1 = self._mem_range
+            f0 = (t0 - view.t0) / view.span
+            f1 = (t1 - view.t0) / view.span
+            self.mem_mark.ui_style = (
+                f"display:block; left:{f0 * 100:.4f}%; width:{(f1 - f0) * 100:.4f}%;"
+            )
+
     def _build_overlay_pools(self):
         self._tick_pool = [Div(ui_style="display:none;") for _ in range(MAX_TICKS + 2)]
         self._axis.ui_children = list(self._tick_pool)
@@ -929,12 +1353,14 @@ class TraceViewer(App):
             else:
                 div.ui_style = "display:none;"
 
+        self._update_mem_mark()
+
         row_h = 1.0 / view.rows_visible
         base_lbl = str(style.label_row)
         for r, div in enumerate(self._label_pool):
             top = (r - view.y0) * row_h
             if -row_h < top < 1.0:
-                div.ui_children = [self.trace.rows[r].name]
+                div.ui_children = [self._row_label(r)]
                 div.ui_class = base_lbl
                 div.ui_style = f"top:{top * 100:.4f}%; height:{row_h * 100:.4f}%;"
             else:

@@ -23,7 +23,7 @@ from webgpu.webgpu_api import (
     VertexStepMode,
 )
 
-from .paje import TraceData
+from .paje import MemoryKind, TraceData
 
 register_shader_directory("ngs_traceview", str(Path(__file__).parent / "shaders"))
 
@@ -173,6 +173,164 @@ class TimelineRenderer(Renderer):
         return ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
 
 
+class MemoryUniforms(UniformBase):
+    """Must match MemoryUniforms in shaders/memory.wgsl."""
+
+    _binding = 62
+    _fields_ = [
+        ("off_hi", ct.c_float),
+        ("off_lo", ct.c_float),
+        ("scale", ct.c_float),
+        ("y_off", ct.c_float),
+        ("y_scale", ct.c_float),
+        ("min_w", ct.c_float),
+        ("canvas_w", ct.c_float),
+        ("canvas_h", ct.c_float),
+        ("bg", ct.c_float * 3),
+        ("line_px", ct.c_float),
+        ("base0", ct.c_float),
+        ("base1", ct.c_float),
+        ("row_pad", ct.c_float),
+        ("_p0", ct.c_float),
+        ("col0", ct.c_float * 3),
+        ("_p1", ct.c_float),
+        ("col1", ct.c_float * 3),
+        ("_p2", ct.c_float),
+        ("grid", ct.c_float * 3),
+        ("_p3", ct.c_float),
+    ]
+
+    def __init__(self, **kwargs):
+        super().__init__(line_px=1.0, row_pad=ROW_PAD + 0.03, **kwargs)
+
+
+_STEP_DTYPE = np.dtype(
+    [("hi", "<f4"), ("lo", "<f4"), ("dur", "<f4"), ("v0", "<f4"), ("v1", "<f4"), ("flags", "<u4")]
+)
+
+# curve colors per theme (host, device); validated categorical slots 1 and 2
+_MEM_COLORS = {
+    "light": ((0.165, 0.471, 0.839), (0.851, 0.349, 0.149), (0.765, 0.761, 0.718)),
+    "dark": ((0.224, 0.529, 0.898), (0.851, 0.349, 0.149), (0.220, 0.220, 0.208)),
+}
+
+
+class MemoryRenderer(Renderer):
+    """The two memory rows: allocated bytes over time as step curves."""
+
+    n_vertices = 18  # three quads per step
+    topology = PrimitiveTopology.triangle_list
+    vertex_entry_point = "vertex_memory"
+    fragment_entry_point = "fragment_memory"
+    select_entry_point = None  # not pickable; hover is resolved on the CPU
+
+    def __init__(self, trace: TraceData, dark: bool = False):
+        super().__init__(label="memory")
+        self.uniforms = MemoryUniforms()
+        self._instance_buffer = None
+        self._data_dirty = True
+        self.set_theme(dark)
+        self.set_trace(trace)
+
+    def set_theme(self, dark: bool):
+        host, device, grid = _MEM_COLORS["dark" if dark else "light"]
+        self.uniforms.col0[:] = host
+        self.uniforms.col1[:] = device
+        self.uniforms.grid[:] = grid
+
+    @staticmethod
+    def _norm(k: MemoryKind):
+        """Value range shown in the row: [min(0, curve min), curve max]."""
+        if len(k.curve_y) == 0:
+            return 0.0, 1.0
+        lo = min(0.0, float(k.curve_y.min()))
+        hi = max(float(k.curve_y.max()), lo + 1.0)
+        return lo, hi
+
+    def set_trace(self, trace: TraceData):
+        self.trace = trace
+        mem = trace.memory
+        parts = []
+        full = max(trace.tmax - trace.tmin, 1.0)
+        if mem is not None:
+            for ki, k in enumerate((mem.host, mem.device)):
+                lo, hi = self._norm(k)
+                base = (0.0 - lo) / (hi - lo)
+                setattr(self.uniforms, f"base{ki}", base)
+                n = len(k.curve_t)
+                inst = np.empty(n + 1, dtype=_STEP_DTYPE)
+                if n:
+                    t = k.curve_t
+                    v = ((k.curve_y - lo) / (hi - lo)).astype(np.float32)
+                    t_hi = t.astype(np.float32)
+                    inst["hi"][:n] = t_hi
+                    inst["lo"][:n] = (t - t_hi.astype(np.float64)).astype(np.float32)
+                    nxt = np.empty(n)
+                    nxt[:-1] = t[1:]
+                    nxt[-1] = trace.tmax + full
+                    inst["dur"][:n] = (nxt - t).astype(np.float32)
+                    inst["v0"][:n] = v
+                    inst["v1"][:n] = np.concatenate((v[1:], v[-1:]))
+                    inst["flags"][:n] = np.uint32(k.row) | (np.uint32(ki) << 8)
+                # zero baseline across the whole time range
+                t0 = trace.tmin - 10 * full
+                inst["hi"][n] = np.float32(t0)
+                inst["lo"][n] = np.float32(t0 - np.float64(np.float32(t0)))
+                inst["dur"][n] = np.float32(21 * full)
+                inst["v0"][n] = inst["v1"][n] = base
+                inst["flags"][n] = np.uint32(k.row) | (np.uint32(ki) << 8) | (1 << 9)
+                parts.append(inst)
+        self._inst = np.concatenate(parts) if parts else np.empty(0, dtype=_STEP_DTYPE)
+        self.n_instances = len(self._inst)
+        self.active = self.n_instances > 0
+        self._data_dirty = True
+        self.set_needs_update()
+
+    def update(self, options: RenderOptions):
+        cc = getattr(options.canvas, "clear_color", None)
+        if cc is not None:
+            self.uniforms.bg[:] = (float(cc.r), float(cc.g), float(cc.b))
+            self.uniforms.update_buffer()
+        if not self._data_dirty:
+            return
+        self._instance_buffer = buffer_from_array(
+            self._inst,
+            usage=BufferUsage.VERTEX | BufferUsage.COPY_DST,
+            label="memory steps",
+            reuse=self._instance_buffer,
+        )
+        self.vertex_buffers = [self._instance_buffer]
+        self.vertex_buffer_layouts = [
+            VertexBufferLayout(
+                arrayStride=_STEP_DTYPE.itemsize,
+                stepMode=VertexStepMode.instance,
+                attributes=[
+                    VertexAttribute(format=VertexFormat.float32x4, offset=0, shaderLocation=0),
+                    VertexAttribute(format=VertexFormat.float32, offset=16, shaderLocation=1),
+                    VertexAttribute(format=VertexFormat.uint32, offset=20, shaderLocation=2),
+                ],
+            )
+        ]
+        self._data_dirty = False
+
+    def set_view(self, view: "TimelineView"):
+        """Copy the view transform from the timeline uniforms."""
+        src = view.renderer.uniforms
+        u = self.uniforms
+        for f in ("off_hi", "off_lo", "scale", "y_off", "y_scale", "min_w", "canvas_w", "canvas_h"):
+            setattr(u, f, getattr(src, f))
+        u.update_buffer()
+
+    def get_bindings(self):
+        return self.uniforms.get_bindings()
+
+    def get_shader_code(self):
+        return read_shader_file("ngs_traceview/memory.wgsl")
+
+    def get_bounding_box(self):
+        return ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
+
+
 class TimelineView:
     """Visible window (time + rows) with ViTE-like pan/zoom semantics.
 
@@ -182,8 +340,9 @@ class TimelineView:
 
     MIN_SPAN = 1e-6  # ms, = 1 ns
 
-    def __init__(self, renderer: TimelineRenderer):
+    def __init__(self, renderer: TimelineRenderer, aux=()):
         self.renderer = renderer
+        self.aux = list(aux)  # renderers that follow this view (memory rows)
         self.scene = None
         self.on_change = []  # callbacks (e.g. axis/label overlay updates)
         self.t0 = 0.0
@@ -306,6 +465,8 @@ class TimelineView:
         u.canvas_w = w
         u.canvas_h = h
         u.update_buffer()
+        for r in self.aux:
+            r.set_view(self)
 
         scene = self.scene
         if scene is not None and scene.canvas is not None:
