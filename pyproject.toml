@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ngs-traceview"
 dynamic = ["version"]
-dependencies = ["platformdirs", "ngapp", "webgpu", "numpy", "ngsolve_gui"]
+dependencies = ["platformdirs", "ngapp", "webgpu", "numpy", "ngsolve_gui>=0.2.4"]
 
 [project.scripts]
 ngs-traceview = "ngs_traceview.__main__:main"
