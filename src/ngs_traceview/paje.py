@@ -13,6 +13,7 @@ import colorsys
 import dataclasses
 import hashlib
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -346,7 +347,7 @@ def _read_events(path, progress=None):
         workers = min(os.cpu_count() or 1, 8)
     except Exception:
         workers = 1
-    if n < 4 * 1024 * 1024:
+    if n < 4 * 1024 * 1024 or sys.platform == "emscripten":  # no threads in pyodide
         workers = 1
 
     bounds = _newline_bounds(data, n, workers)

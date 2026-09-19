@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 from ngapp.app import App
+from ngapp.utils import is_pyodide
 from ngapp.components import (
     Component,
     Div,
@@ -31,6 +32,26 @@ MAX_TICKS = 11
 NAME_MAX = 90  # truncate long C++ symbols in the table
 SUN_RINGS = 5  # rings drawn below the focused stack
 SUN_LIST = 12  # children listed under the sunburst
+
+
+# pyodide cannot start threads: run inline / schedule on the browser event loop
+def run_background(func, *args):
+    if is_pyodide():
+        func(*args)
+    else:
+        threading.Thread(target=func, args=args, daemon=True).start()
+
+
+def call_later(delay, func):
+    """Run func after delay seconds; the returned handle has .cancel()."""
+    if is_pyodide():
+        import asyncio
+
+        return asyncio.get_event_loop().call_later(delay, func)
+    t = threading.Timer(delay, func)
+    t.daemon = True
+    t.start()
+    return t
 
 
 def nice_ticks(t0: float, t1: float, max_ticks: int = MAX_TICKS):
@@ -541,10 +562,10 @@ class TraceViewer(App):
             with self.file_input.as_temporary_file as path:
                 self._load(str(path))
 
-        threading.Thread(target=work, daemon=True).start()
+        run_background(work)
 
     def _load_async(self, path: str):
-        threading.Thread(target=self._load, args=(path,), daemon=True).start()
+        run_background(self._load, path)
 
     def _on_progress(self, frac, msg):
         base = os.path.basename(self._loading_path or "")
@@ -1072,10 +1093,7 @@ class TraceViewer(App):
 
     def _schedule_hide(self):
         self._cancel_hide()
-        t = threading.Timer(0.09, self._hide_now)
-        t.daemon = True
-        self._hide_timer = t
-        t.start()
+        self._hide_timer = call_later(0.09, self._hide_now)
 
     def _hide_now(self):
         self._shown_pick = None
@@ -1250,10 +1268,7 @@ class TraceViewer(App):
         t = self._stats_timer
         if t is not None:
             t.cancel()
-        t = threading.Timer(0.25, self._refresh_stats)
-        t.daemon = True
-        self._stats_timer = t
-        t.start()
+        self._stats_timer = call_later(0.25, self._refresh_stats)
 
     def _refresh_stats(self):
         if self.trace is None or not self._stats_open or self._side_mode != "stats":
