@@ -10,7 +10,7 @@ config = AppConfig(
     name="Trace Viewer",
     version = __version__,
     python_class=TraceViewer,
-    frontend_pip_dependencies=["numpy", "ngsolve_gui>=0.2.5"],
+    frontend_pip_dependencies=["numpy", "cerbsim_ngapp_style>=0.1.0"],
     description=_DESCRIPTION,
 )
     

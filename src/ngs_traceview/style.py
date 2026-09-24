@@ -1,6 +1,6 @@
 """Trace-viewer styling.
 
-Reuses the CerbSIM design system from :mod:`ngsolve_gui.cerbsim_style` (design
+Reuses the CerbSIM design system from :mod:`cerbsim_ngapp_style` (design
 tokens as CSS custom properties, IBM Plex fonts, Quasar brand-colour mapping,
 light/dark themes) and adds only the handful of classes the trace viewer needs
 that have no Quasar equivalent: the positioned time-axis / row-label overlays,
@@ -9,7 +9,7 @@ buttons, the statistics table) uses Quasar components directly.
 """
 
 from ngapp.style import Style, StyleSheet
-from ngsolve_gui import cerbsim_style as cb
+import cerbsim_ngapp_style as cb
 
 # geometry shared with app.py
 LABEL_WIDTH = 200  # px, row-label column
